@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from kizaru_mcp.auth.provider import LightdashOAuthProvider
 from kizaru_mcp.lightdash import LightdashClient
-from kizaru_mcp.tools.common import READ, Name, Uuid, lightdash
+from kizaru_mcp.tools.common import READ, ChartRef, Name, Uuid, lightdash, resolve_chart
 
 Operator = Literal[
     "isNull",
@@ -193,11 +193,12 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         return _table(results)
 
     @server.tool(annotations=READ)
-    async def run_chart(project_uuid: Uuid, chart_uuid: Uuid, dashboard_uuid: Uuid | None = None) -> dict[str, Any]:
-        """Run a saved chart as it is saved: its fields, filters, sorts and row limit. Give dashboard_uuid to apply
-        that dashboard's filters too, as people see it on the dashboard. Returns at most 2500 rows;
-        truncated is true when there are more."""
+    async def run_chart(project_uuid: Uuid, chart_uuid: ChartRef, dashboard_uuid: Uuid | None = None) -> dict[str, Any]:
+        """Run a saved chart as it is saved: its fields, filters, sorts and row limit. chart_uuid is the chart's
+        UUID or its slug. Give dashboard_uuid to apply that dashboard's filters too, as people see it on the
+        dashboard. Returns at most 2500 rows; truncated is true when there are more."""
         async with lightdash(provider) as ld:
+            chart_uuid = await resolve_chart(ld, project_uuid, chart_uuid)
             if dashboard_uuid is None:
                 results = await _run(ld, project_uuid, "chart", {"chartUuid": chart_uuid}, MAX_ROWS)
             else:
