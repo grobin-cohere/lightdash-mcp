@@ -317,9 +317,8 @@ class LightdashOAuthProvider:
                 "subject": grant.subject,
                 "grant_id": grant_id,
             }
-            await self.store.put(
-                "access", digest(access), Access(token=access, expires_at=int(time.time()) + ACCESS_TTL, **common), ACCESS_TTL
-            )
+            ttl = self.settings.access_token_ttl
+            await self.store.put("access", digest(access), Access(token=access, expires_at=int(time.time()) + ttl, **common), ttl)
             await self.store.put(
                 "refresh",
                 digest(refresh),
@@ -333,7 +332,7 @@ class LightdashOAuthProvider:
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
-            expires_in=ACCESS_TTL,
+            expires_in=self.settings.access_token_ttl,
             refresh_token=refresh,
             scope=" ".join(scopes) or None,
         )
