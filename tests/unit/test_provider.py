@@ -410,3 +410,13 @@ async def test_consent_cookie_is_secure_behind_an_https_public_url(provider):
     provider.settings.public_url = "https://mcp.example.com"
     _, cookie = await consent_page(provider, "http://localhost:9999/callback")
     assert "secure" in cookie.lower()
+
+
+async def test_issued_access_tokens_follow_the_configured_lifetime(provider):
+    provider.settings.access_token_ttl = 24 * 60 * 60
+    await add_grant(provider, 3600)
+    issued = await provider._issue("grant", [], None)
+    assert issued.expires_in == 24 * 60 * 60
+    access = await provider.load_access_token(issued.access_token)
+    assert access.expires_at - time.time() > 23 * 60 * 60
+    assert await provider.store._redis.ttl(f"kizaru-mcp:access:{digest(issued.access_token)}") > 23 * 60 * 60

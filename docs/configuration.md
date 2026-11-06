@@ -50,6 +50,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `HOST` | No | `127.0.0.1` | Address the server listens on |
 | `PORT` | No | `8000` | Port the server listens on |
 | `PUBLIC_URL` | No | `http://localhost:<PORT>` | The address clients reach this server at, as in [Behind a proxy or a tunnel](#behind-a-proxy-or-a-tunnel). It is the OAuth issuer, and its host is accepted on incoming requests |
+| `ACCESS_TOKEN_TTL` | No | `3600` | Seconds an access token issued to MCP clients lasts, from 60 to 1209600 (14 days). Raise it for clients that never refresh their token, such as Dex's OAuth connector: with the default they get 401 an hour after signing in |
 
 Generate a `FERNET_KEY`:
 

@@ -104,3 +104,10 @@ async def test_health_follows_redis():
         app = create_server(settings, redis).streamable_http_app()
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://localhost") as client:
             assert (await client.get("/health")).status_code == status
+
+
+def test_access_token_lifetime_is_bounded():
+    assert Settings(_env_file=None).access_token_ttl == 3600
+    assert Settings(_env_file=None, access_token_ttl=86400).access_token_ttl == 86400
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, access_token_ttl=30 * 24 * 60 * 60)
