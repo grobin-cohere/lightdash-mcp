@@ -12,6 +12,7 @@ from kizaru_mcp.config import Settings
 from kizaru_mcp.lightdash import LightdashClient
 from kizaru_mcp.server import asgi_app, create_server
 from kizaru_mcp.tools.code import _require, check_chart, check_dashboard, preview, save
+from kizaru_mcp.tools.common import resolve_chart
 
 LIGHTDASH = "http://lightdash.test"
 PROJECT = "3675b69e-8324-4110-bdca-059031aa8da3"
@@ -99,7 +100,8 @@ async def test_preview_says_whether_it_creates_or_replaces():
     mock_lightdash(existing=[{"name": "Old revenue", "spaceSlug": "finance", "updatedAt": "2026-11-01"}])
     async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
         replaced = await preview(await client(http), PROJECT, "charts", CHART)
-    assert replaced == {
+    assert replaced["next"].startswith("Nothing is saved yet. Call save_chart again with dry_run=false")
+    assert {k: v for k, v in replaced.items() if k != "next"} == {
         "wouldUpdate": {
             "slug": "revenue-per-week",
             "name": "Revenue per week",
@@ -130,13 +132,12 @@ async def test_save_keeps_new_spaces_private_and_validates():
 
 
 @respx.mock
-async def test_dashboard_tiles_must_show_charts_that_exist():
+async def test_dashboard_tiles_are_checked_and_unsaved_charts_listed():
     tile = {"type": "saved_chart", "x": 0, "y": 0, "w": 36, "h": 8, "properties": {"chartSlug": "revenue-per-week"}}
     mock_lightdash(missing=["revenue-per-week"])
     async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
         ld = await client(http)
-        with pytest.raises(ToolError, match="No chart with slug revenue-per-week"):
-            await check_dashboard(ld, PROJECT, {"tiles": [tile]})
+        assert await check_dashboard(ld, PROJECT, {"tiles": [tile]}) == ["revenue-per-week"]
         with pytest.raises(ToolError, match="Tile 0 is a saved_chart tile without properties.chartSlug"):
             await check_dashboard(ld, PROJECT, {"tiles": [tile | {"properties": {}}]})
         with pytest.raises(ToolError, match="Tile 0 needs w, h"):
@@ -148,8 +149,12 @@ async def test_slugs_cannot_reach_other_endpoints():
         _env_file=None, lightdash_client_id="id", lightdash_client_secret="secret", fernet_key=Fernet.generate_key().decode()
     )
     server = create_server(settings)
-    with pytest.raises(ToolError, match="validation error"):
-        await server.call_tool("get_chart_code", {"project_uuid": PROJECT, "slug": "../../org"})
+    for name, arguments in [
+        ("get_chart_code", {"project_uuid": PROJECT, "slug": "../../org"}),
+        ("run_chart", {"project_uuid": PROJECT, "chart_uuid": "../../org/users"}),
+    ]:
+        with pytest.raises(ToolError, match="validation error"):
+            await server.call_tool(name, arguments)
 
 
 async def test_token_endpoint_accepts_a_client_id_sent_only_in_the_basic_header():
@@ -188,3 +193,19 @@ async def test_token_endpoint_accepts_a_client_id_sent_only_in_the_basic_header(
     # The client is authenticated: only the made-up code is refused.
     assert (accepted.status_code, accepted.json()["error"]) == (400, "invalid_grant")
     assert (refused.status_code, refused.json()["error"]) == (401, "invalid_client")
+
+
+@respx.mock
+async def test_charts_can_be_given_by_slug_within_the_project():
+    respx.get(f"{LIGHTDASH}/api/v1/saved/revenue-per-week").mock(
+        return_value=httpx.Response(200, json={"results": {"uuid": CHART_UUID, "projectUuid": PROJECT}})
+    )
+    respx.get(f"{LIGHTDASH}/api/v1/saved/other-project-chart").mock(
+        return_value=httpx.Response(200, json={"results": {"uuid": CHART_UUID, "projectUuid": "another"}})
+    )
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        ld = await client(http)
+        assert await resolve_chart(ld, PROJECT, CHART_UUID) == CHART_UUID
+        assert await resolve_chart(ld, PROJECT, "revenue-per-week") == CHART_UUID
+        with pytest.raises(ToolError, match="No chart with slug other-project-chart in this project"):
+            await resolve_chart(ld, PROJECT, "other-project-chart")

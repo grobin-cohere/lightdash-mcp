@@ -28,7 +28,7 @@ Write tools are marked idempotent where repeating them changes nothing. Destruct
 | `list_explores` | `project_uuid` | Explores with label, group and description, and errors when they don't compile | `/projects/{p}/explores` |
 | `get_explore` | `project_uuid`, `explore` | Visible dimensions and metrics, joined tables included, with field ID, label, type, table and description | `/projects/{p}/explores/{e}` |
 | `run_query` | `project_uuid`, `explore`, `dimensions`, `metrics`, `filters`, `sorts`, `limit` (500) | Column labels, rows of raw values (at most 2500), and `truncated` when more rows match | `POST /api/v2/projects/{p}/query/metric-query`, then `/api/v2/projects/{p}/query/{q}` |
-| `run_chart` | `project_uuid`, `chart_uuid`, `dashboard_uuid` | A saved chart's results as saved, with the dashboard's filters when `dashboard_uuid` is given. Same shape as `run_query` | `POST /api/v2/projects/{p}/query/chart` or `/query/dashboard-chart`, then `/api/v2/projects/{p}/query/{q}` |
+| `run_chart` | `project_uuid`, `chart_uuid` (UUID or slug), `dashboard_uuid` | A saved chart's results as saved, with the dashboard's filters when `dashboard_uuid` is given. Same shape as `run_query` | `POST /api/v2/projects/{p}/query/chart` or `/query/dashboard-chart`, then `/api/v2/projects/{p}/query/{q}` |
 
 A filter is `{field_id, operator, values, settings}`. Filters are combined with AND; a filter on a metric applies after aggregation. Date filters take `settings`, such as `inThePast` with `values: [30]` and `settings: {"unitOfTime": "days"}`.
 
@@ -56,9 +56,9 @@ Charts and dashboards as code, in the format that `lightdash download` writes an
 | `get_chart_code` | `project_uuid`, `slug` | Returns a chart as code: explore, fields, filters, sorts, chart configuration | `GET /projects/{p}/code/charts?ids=` |
 | `get_dashboard_code` | `project_uuid`, `slug` | Returns a dashboard as code: tiles with their position and chart slug, tabs, filters | `GET /projects/{p}/code/dashboards?ids=` |
 | `save_chart` | `project_uuid`, `chart`, `dry_run` | Creates a chart, or replaces the one with the same slug, then validates it. Refuses fields its explore doesn't have | `POST /projects/{p}/code/charts/{slug}`, `POST /projects/{p}/validate/chart/{c}` |
-| `save_dashboard` | `project_uuid`, `dashboard`, `dry_run` | Creates a dashboard, or replaces the one with the same slug, then validates it. Refuses tiles that show a chart that doesn't exist | `POST /projects/{p}/code/dashboards/{slug}`, `POST /projects/{p}/validate/dashboard/{d}` |
+| `save_dashboard` | `project_uuid`, `dashboard`, `dry_run` | Creates a dashboard, or replaces the one with the same slug, then validates it. A dry run lists the charts its tiles show that aren't saved yet; saving refuses them | `POST /projects/{p}/code/dashboards/{slug}`, `POST /projects/{p}/validate/dashboard/{d}` |
 
-`save_chart` and `save_dashboard` are marked destructive because they can replace content: `dry_run` says whether they would create or replace, and what they would replace. Both return the content's URL.
+`save_chart` and `save_dashboard` are marked destructive because they can replace content: `dry_run` says whether they would create or replace, and what they would replace, and ends with the call that saves. Both return the content's URL.
 
 Project roles are `viewer`, `interactive_viewer`, `editor`, `developer` and `admin`.
 

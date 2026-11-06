@@ -70,8 +70,9 @@ async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, A
         raise ToolError(f"Unknown fields in {explore}: {', '.join(unknown)}. See get_explore.")
 
 
-async def check_dashboard(ld: LightdashClient, project_uuid: str, dashboard: dict[str, Any]) -> None:
-    """Fail before saving when a tile is malformed or shows a chart that doesn't exist: Lightdash would save it empty."""
+async def check_dashboard(ld: LightdashClient, project_uuid: str, dashboard: dict[str, Any]) -> list[str]:
+    """Fail when a tile is malformed. Return the chart slugs its tiles show that don't exist yet: Lightdash would
+    save those tiles empty, so saving fails until they exist, but a dry run only reports them."""
     tiles = dashboard["tiles"]
     if not isinstance(tiles, list):
         raise ToolError("tiles must be a list.")
@@ -82,10 +83,9 @@ async def check_dashboard(ld: LightdashClient, project_uuid: str, dashboard: dic
         if tile["type"] == "saved_chart" and not (tile["properties"] or {}).get("chartSlug"):
             raise ToolError(f"Tile {n} is a saved_chart tile without properties.chartSlug.")
     slugs = sorted({t["properties"]["chartSlug"] for t in tiles if t["type"] == "saved_chart"})
-    if slugs:
-        missing_charts = (await _read(ld, project_uuid, "charts", slugs)).get("missingIds") or []
-        if missing_charts:
-            raise ToolError(f"No chart with slug {', '.join(missing_charts)} in this project. Save it with save_chart first.")
+    if not slugs:
+        return []
+    return sorted((await _read(ld, project_uuid, "charts", slugs)).get("missingIds") or [])
 
 
 async def _space_exists(ld: LightdashClient, project_uuid: str, space_slug: str) -> bool:
@@ -102,7 +102,11 @@ async def preview(ld: LightdashClient, project_uuid: str, kind: Kind, item: dict
         }
     if not await _space_exists(ld, project_uuid, item["spaceSlug"]):
         summary["newSpace"] = "Lightdash creates this space, visible only to you and admins until you share it."
-    return {"wouldUpdate" if existing else "wouldCreate": summary}
+    singular = kind[:-1]
+    return {
+        "wouldUpdate" if existing else "wouldCreate": summary,
+        "next": f"Nothing is saved yet. Call save_{singular} again with dry_run=false to save this {singular}.",
+    }
 
 
 async def save(ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], lightdash_url: str) -> dict[str, Any]:
@@ -163,13 +167,25 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """Create a dashboard, or replace the dashboard with the same slug, from dashboard code: name, slug,
         spaceSlug and tiles, as get_dashboard_code returns them. A tile has type (saved_chart, markdown),
         x, y, w and h on a 36-column grid, and properties: chartSlug for a saved chart, title and content for
-        markdown. Save its charts with save_chart first. tabs and filters are optional.
+        markdown. tabs and filters are optional. Its charts must be saved, with save_chart and dry_run=false,
+        before the dashboard itself can be saved; a dry run lists the ones that aren't yet.
         dry_run, on by default, checks the dashboard and says whether it would create or replace one.
         Pass dry_run=false to save; the result has the dashboard's URL."""
         _require(dashboard, DASHBOARD_KEYS, "dashboard")
         item = {"version": 1, "tabs": [], "filters": {"dimensions": [], "metrics": [], "tableCalculations": []}, **dashboard}
         async with lightdash(provider) as ld:
-            await check_dashboard(ld, project_uuid, item)
+            missing = await check_dashboard(ld, project_uuid, item)
             if dry_run:
-                return await preview(ld, project_uuid, "dashboards", item)
+                result = await preview(ld, project_uuid, "dashboards", item)
+                if missing:
+                    result["chartsNotSavedYet"] = missing
+                    result["next"] = (
+                        f"Nothing is saved yet. Save {', '.join(missing)} with save_chart and dry_run=false, "
+                        "then call save_dashboard with dry_run=false."
+                    )
+                return result
+            if missing:
+                raise ToolError(
+                    f"No chart with slug {', '.join(missing)} in this project yet. Save it with save_chart and dry_run=false first."
+                )
             return await save(ld, project_uuid, "dashboards", item, provider.settings.lightdash_url)
