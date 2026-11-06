@@ -47,6 +47,19 @@ A filter is `{field_id, operator, values, settings}`. Filters are combined with 
 | `update_scheduler` | `scheduler_uuid`, `name`, `cron`, `timezone`, `message` | Changes the fields given, keeps the rest | `PATCH /schedulers/{s}` |
 | `delete_scheduler` | `scheduler_uuid`, `dry_run` | Deletes a delivery | `DELETE /schedulers/{s}` |
 
+## Build
+
+Charts and dashboards as code, in the format that `lightdash download` writes and `lightdash upload` reads, so content made through Kizaru can be pulled into a repository later.
+
+| Tool | Parameters | Does | Lightdash API |
+| --- | --- | --- | --- |
+| `get_chart_code` | `project_uuid`, `slug` | Returns a chart as code: explore, fields, filters, sorts, chart configuration | `GET /projects/{p}/code/charts?ids=` |
+| `get_dashboard_code` | `project_uuid`, `slug` | Returns a dashboard as code: tiles with their position and chart slug, tabs, filters | `GET /projects/{p}/code/dashboards?ids=` |
+| `save_chart` | `project_uuid`, `chart`, `dry_run` | Creates a chart, or replaces the one with the same slug, then validates it. Refuses fields its explore doesn't have | `POST /projects/{p}/code/charts/{slug}`, `POST /projects/{p}/validate/chart/{c}` |
+| `save_dashboard` | `project_uuid`, `dashboard`, `dry_run` | Creates a dashboard, or replaces the one with the same slug, then validates it. Refuses tiles that show a chart that doesn't exist | `POST /projects/{p}/code/dashboards/{slug}`, `POST /projects/{p}/validate/dashboard/{d}` |
+
+`save_chart` and `save_dashboard` are marked destructive because they can replace content: `dry_run` says whether they would create or replace, and what they would replace. Both return the content's URL.
+
 Project roles are `viewer`, `interactive_viewer`, `editor`, `developer` and `admin`.
 
 ## Things to know
@@ -57,4 +70,6 @@ Project roles are `viewer`, `interactive_viewer`, `editor`, `developer` and `adm
 - A query that runs longer than 120 seconds is cancelled.
 
 - Deleting content is permanent on a default Lightdash instance: it doesn't appear in the deleted-content list.
+- A chart or dashboard saved into a `spaceSlug` that doesn't exist creates that space, restricted to its creator and admins. Share it, or move the content, to show it to others.
+- Lightdash saves a dashboard tile whose chart slug doesn't exist as an empty tile, and its validation doesn't report it, so `save_dashboard` checks every chart slug first.
 - Lightdash's `PATCH /schedulers/{s}` needs the whole scheduler. `update_scheduler` reads it, applies the changes, and sends it all back.
