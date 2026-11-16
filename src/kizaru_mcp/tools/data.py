@@ -112,22 +112,29 @@ def _table(results: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _explores(ld: LightdashClient, project_uuid: str) -> list[dict[str, Any]]:
+    # filtered=true applies the project's tables configuration, as Lightdash's own explore list does,
+    # so the tables an admin hid in Lightdash stay hidden here too.
+    explores = await ld.get(f"/api/v1/projects/{project_uuid}/explores", filtered="true")
+    return [
+        {
+            "name": e["name"],
+            "label": e.get("label"),
+            "group": e.get("groupLabel"),
+            "description": e.get("description"),
+            **({"errors": [error.get("message") for error in e["errors"]]} if e.get("errors") else {}),
+        }
+        for e in explores
+    ]
+
+
 def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     @server.tool(annotations=READ)
     async def list_explores(project_uuid: Uuid) -> list[dict[str, Any]]:
-        """List the explores of a project: the tables you can query, with what each one holds."""
+        """List the explores of a project: the tables you can query, with what each one holds.
+        Tables that the project's tables configuration hides are left out, as in Lightdash."""
         async with lightdash(provider) as ld:
-            explores = await ld.get(f"/api/v1/projects/{project_uuid}/explores")
-        return [
-            {
-                "name": e["name"],
-                "label": e.get("label"),
-                "group": e.get("groupLabel"),
-                "description": e.get("description"),
-                **({"errors": [error.get("message") for error in e["errors"]]} if e.get("errors") else {}),
-            }
-            for e in explores
-        ]
+            return await _explores(ld, project_uuid)
 
     @server.tool(annotations=READ)
     async def get_explore(project_uuid: Uuid, explore: Name) -> dict[str, Any]:

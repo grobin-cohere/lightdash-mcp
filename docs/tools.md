@@ -25,7 +25,7 @@ Write tools are marked idempotent where repeating them changes nothing. Destruct
 
 | Tool | Parameters | Returns | Lightdash API |
 | --- | --- | --- | --- |
-| `list_explores` | `project_uuid` | Explores with label, group and description, and errors when they don't compile | `/projects/{p}/explores` |
+| `list_explores` | `project_uuid` | Explores with label, group and description, and errors when they don't compile. Leaves out the tables that the project's tables configuration hides, as Lightdash does | `/projects/{p}/explores?filtered=true` |
 | `get_explore` | `project_uuid`, `explore` | Visible dimensions and metrics, joined tables included, with field ID, label, type, table and description | `/projects/{p}/explores/{e}` |
 | `run_query` | `project_uuid`, `explore`, `dimensions`, `metrics`, `filters`, `sorts`, `limit` (500) | Column labels, rows of raw values (at most 2500), and `truncated` when more rows match | `POST /api/v2/projects/{p}/query/metric-query`, then `/api/v2/projects/{p}/query/{q}` |
 | `run_chart` | `project_uuid`, `chart_uuid` (UUID or slug), `dashboard_uuid` | A saved chart's results as saved, with the dashboard's filters when `dashboard_uuid` is given. Same shape as `run_query` | `POST /api/v2/projects/{p}/query/chart` or `/query/dashboard-chart`, then `/api/v2/projects/{p}/query/{q}` |
