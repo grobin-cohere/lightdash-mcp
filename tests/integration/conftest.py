@@ -21,9 +21,9 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from redis.asyncio import Redis
 
-from kizaru_mcp.auth.provider import _challenge
-from kizaru_mcp.config import Settings
-from kizaru_mcp.server import create_server, transport_security
+from lightdash_mcp.auth.provider import _challenge
+from lightdash_mcp.config import Settings
+from lightdash_mcp.server import asgi_app
 
 LIGHTDASH = "http://localhost:8080"
 PUBLIC_PORT = 8765
@@ -47,7 +47,7 @@ def settings() -> Settings:
     registered = httpx.post(
         f"{LIGHTDASH}/api/v1/oauth/register",
         json={
-            "client_name": "kizaru-mcp-tests",
+            "client_name": "lightdash-mcp-tests",
             "redirect_uris": [f"{PUBLIC}/oauth/lightdash/callback"],
             "scope": "read write",
         },
@@ -66,9 +66,7 @@ def settings() -> Settings:
 
 @pytest.fixture(scope="session")
 def server(settings: Settings):
-    app = create_server(settings, Redis.from_url(settings.redis_url)).streamable_http_app(
-        transport_security=transport_security(settings)
-    )
+    app = asgi_app(settings, Redis.from_url(settings.redis_url))
     instance = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PUBLIC_PORT, log_level="warning"))
     thread = threading.Thread(target=instance.run, daemon=True)
     thread.start()

@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Kizaru: an MCP server for self-hosted Lightdash (data queries, access, content, deliveries). Python 3.15+, managed with uv.
+lightdash-mcp: an MCP server for self-hosted Lightdash (data queries, access, content, deliveries). Python 3.15+, managed with uv.
 
 ## Commands
 
@@ -17,20 +17,20 @@ Kizaru: an MCP server for self-hosted Lightdash (data queries, access, content, 
 - Single test: `uv run pytest tests/unit/test_provider.py::test_name`
 - Unit tests use `respx` and `fakeredis`. Integration tests (`tests/integration`) need the local Lightdash from `make dev`, start the server on port 8765, use Redis db 15, and skip themselves when Lightdash is down. They modify the demo data: run `make clean` and `make dev` after an interrupted run.
 - CI runs `uv sync --locked`, ruff and pytest on Python 3.15.
-- `Dockerfile` builds the server image (uv build stage, slim runtime as `nobody`, `HOST=0.0.0.0`). `.github/workflows/docker.yml` pushes it to `ghcr.io/ntrossat/kizaru-mcp` (tags: `pyproject.toml` version and `latest`, amd64 and arm64) on each published release or by hand.
-- `.github/workflows/pypi.yml` builds the package with `uv build` and publishes it to PyPI (`uv publish`, trusted publishing) on each published release.
+- `Dockerfile` builds the server image (uv build stage, slim runtime as `nobody`, `HOST=0.0.0.0`). `.github/workflows/docker.yml` pushes it to `ghcr.io/grobin-cohere/lightdash-mcp` (tags: `pyproject.toml` version and `latest`, amd64 and arm64) on each published release or by hand.
+- Not published to PyPI: the `lightdash-mcp` name there belongs to another project. The Docker image is the release.
 - Run `make lint` and `make test` before a PR, and update `docs/` in the same change as the code.
 
 ## Architecture
 
 One process built on the official MCP Python SDK (`MCPServer`, Streamable HTTP). It is both the MCP server and the OAuth authorization server its clients sign in with, and it calls the Lightdash REST API with each user's own Lightdash token. All state is in Redis, encrypted with `FERNET_KEY`. Details in `docs/architecture.md`.
 
-- `server.py`: `create_server` wires the auth settings, the custom routes (`/health`, `/oauth/consent`, `/oauth/lightdash/callback`), the `audit` middleware (one log line per tool call), a lifespan that closes the shared HTTP client, and each tools module's `register(server, provider)`. `transport_security` adds `PUBLIC_URL`'s host to the SDK's localhost-only allowed hosts.
+- `server.py`: `create_server` wires the auth settings, the custom routes (`/health`, `/oauth/consent`, `/oauth/lightdash/callback`), the `audit` middleware (one log line per tool call), a lifespan that closes the shared HTTP client, and each tools module's `register(server, provider)`. `transport_security` adds `PUBLIC_URL`'s host to the SDK's localhost-only allowed hosts. `asgi_app` wraps the app in `BasicAuthClientId`, which copies a Basic header's client ID into `/token` bodies that lack one: the SDK requires it in the body, and Dex (North) sends it only in the header.
 - `auth/provider.py`: `LightdashOAuthProvider` proxies sign-in to Lightdash OAuth. A grant (one sign-in) holds the Lightdash tokens; clients only get the server's own tokens, which point to the grant. Lightdash tokens never leave the server. Refreshes run under a Redis lock per grant and save new tokens before use. `invalid_grant` from Lightdash ends the grant; other errors keep it.
-- `auth/store.py`: encrypted Redis storage and locks. Keys are `kizaru-mcp:{client,transaction,code,access,refresh,grant}:<id>`, token keys are sha256 digests.
+- `auth/store.py`: encrypted Redis storage and locks. Keys are `lightdash-mcp:{client,transaction,code,access,refresh,grant}:<id>`, token keys are sha256 digests.
 - `lightdash.py`: async `LightdashClient` and `LightdashError`. Every client shares the provider's `httpx.AsyncClient` (`provider.http`).
 - `tools/common.py`: every tool body runs inside `async with lightdash(provider) as ld:`, which gets the signed-in user's token (refreshing it if needed) and maps Lightdash errors to `ToolError` (a 401 refreshes the token and retries once; a second 401 ends the grant). It also defines the tool annotations (`READ`, `WRITE`, `CREATE`, `DESTRUCTIVE`) and the `Uuid` / `Name` argument types, which must be used for anything interpolated into a Lightdash URL path.
-- `tools/{access,content,schedulers,data}.py`: the tools, each module with a `register` function. Destructive tools take `dry_run` (default `True`, so they only preview unless called with `dry_run=false`) and use the `DESTRUCTIVE` annotation. Every tool is listed in `docs/tools.md` with the Lightdash API it calls.
+- `tools/{access,content,schedulers,data,code}.py`: the tools, each module with a `register` function. `code.py` reads and saves charts and dashboards through Lightdash's content-as-code API, the one `lightdash upload` uses. Destructive tools take `dry_run` (default `True`, so they only preview unless called with `dry_run=false`) and use the `DESTRUCTIVE` annotation. Every tool is listed in `docs/tools.md` with the Lightdash API it calls.
 
 ## Configuration
 

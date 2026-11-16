@@ -4,8 +4,8 @@ from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 
-from kizaru_mcp.auth.provider import LightdashOAuthProvider
-from kizaru_mcp.tools.common import CREATE, DESTRUCTIVE, READ, WRITE, Uuid, data, full_name, lightdash, pick
+from lightdash_mcp.auth.provider import LightdashOAuthProvider
+from lightdash_mcp.tools.common import CREATE, DESTRUCTIVE, READ, WRITE, Uuid, data, full_name, lightdash, pick
 
 ProjectRole = Literal["viewer", "interactive_viewer", "editor", "developer", "admin"]
 

@@ -1,3 +1,4 @@
+import re
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -8,8 +9,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from kizaru_mcp.auth.provider import Access, LightdashOAuthProvider, SignInRequired
-from kizaru_mcp.lightdash import LightdashClient, LightdashError
+from lightdash_mcp.auth.provider import Access, LightdashOAuthProvider, SignInRequired
+from lightdash_mcp.lightdash import LightdashClient, LightdashError
 
 RECONNECT = "Your Lightdash sign-in has ended. Reconnect this MCP server to sign in again."
 UNREACHABLE = "Couldn't reach Lightdash. Try again in a moment."
@@ -22,6 +23,19 @@ DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idemp
 # Arguments that go into Lightdash URL paths: a `../` or `?` in one would reach another endpoint.
 Uuid = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")]
 Name = Annotated[str, Field(pattern=r"^[\w-]+$")]
+# A chart's UUID or its slug: lowercase letters, digits and hyphens, so it is safe in a path too.
+ChartRef = Annotated[str, Field(pattern=r"^[0-9a-z][0-9a-z-]*$|^[0-9a-fA-F-]{36}$")]
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+async def resolve_chart(ld: LightdashClient, project_uuid: str, chart: str) -> str:
+    """The UUID of a chart of the project, given by UUID or by slug."""
+    if UUID_PATTERN.match(chart):
+        return chart
+    found = await ld.get(f"/api/v1/saved/{chart}")
+    if found.get("projectUuid") != project_uuid:
+        raise ToolError(f"No chart with slug {chart} in this project.")
+    return found["uuid"]
 
 
 @asynccontextmanager

@@ -4,8 +4,8 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from kizaru_mcp.auth.provider import LightdashOAuthProvider
-from kizaru_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, data, lightdash
+from lightdash_mcp.auth.provider import LightdashOAuthProvider
+from lightdash_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, data, lightdash
 
 # Fields Lightdash expects back when a scheduler is updated: PATCH takes the whole scheduler.
 UPDATABLE = (

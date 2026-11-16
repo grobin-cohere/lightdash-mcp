@@ -27,8 +27,8 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from kizaru_mcp.auth.store import LOCK_TIMEOUT, Store, digest
-from kizaru_mcp.config import Settings
+from lightdash_mcp.auth.store import LOCK_TIMEOUT, Store, digest
+from lightdash_mcp.config import Settings
 
 SCOPE = "lightdash"
 LIGHTDASH_SCOPE = "read write"
@@ -39,7 +39,7 @@ REFRESH_TTL = 14 * 24 * 60 * 60  # Lightdash's refresh-token lifetime
 REFRESH_MARGIN = 60
 REFRESH_TIMEOUT = LOCK_TIMEOUT - 10  # a refresh ends while it still holds the grant's lock
 CLIENT_TTL = 30 * 24 * 60 * 60  # renewed on use: registration is open, so unused clients must expire
-CONSENT_COOKIE = "kizaru_mcp_consent"  # one per transaction, suffixed with its digest
+CONSENT_COOKIE = "lightdash_mcp_consent"  # one per transaction, suffixed with its digest
 
 
 class SignInRequired(Exception):
@@ -317,9 +317,8 @@ class LightdashOAuthProvider:
                 "subject": grant.subject,
                 "grant_id": grant_id,
             }
-            await self.store.put(
-                "access", digest(access), Access(token=access, expires_at=int(time.time()) + ACCESS_TTL, **common), ACCESS_TTL
-            )
+            ttl = self.settings.access_token_ttl
+            await self.store.put("access", digest(access), Access(token=access, expires_at=int(time.time()) + ttl, **common), ttl)
             await self.store.put(
                 "refresh",
                 digest(refresh),
@@ -333,7 +332,7 @@ class LightdashOAuthProvider:
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
-            expires_in=ACCESS_TTL,
+            expires_in=self.settings.access_token_ttl,
             refresh_token=refresh,
             scope=" ".join(scopes) or None,
         )

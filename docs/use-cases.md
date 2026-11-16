@@ -1,6 +1,6 @@
 # Use cases
 
-What you can ask once Kizaru is connected. Screenshots from Claude.ai on the local Lightdash demo (`make dev`).
+What you can ask once lightdash-mcp is connected. Screenshots from Claude.ai on the local Lightdash demo (`make dev`).
 
 ## Monthly report
 
