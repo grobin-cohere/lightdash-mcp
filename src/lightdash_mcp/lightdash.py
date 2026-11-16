@@ -31,7 +31,9 @@ class LightdashClient:
     client, so calls reuse its connections to Lightdash.
     """
 
-    def __init__(self, http: httpx.AsyncClient, access_token: str, refresh: Callable[[], Awaitable[str]] | None = None) -> None:
+    def __init__(
+        self, http: httpx.AsyncClient, access_token: str, refresh: Callable[[str], Awaitable[str]] | None = None
+    ) -> None:
         self._http = http
         self._token = access_token
         self._refresh = refresh
@@ -42,9 +44,10 @@ class LightdashClient:
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         response = await self._send(method, path, **kwargs)
-        # The token can expire during a long call, such as a query: refresh it and retry once.
+        # The token can expire during a long call, such as a query: refresh it and retry once. `refresh` gets the
+        # refused token, so concurrent calls refused with the same token refresh it once.
         if response.status_code == 401 and self._refresh:
-            self._token = await self._refresh()
+            self._token = await self._refresh(self._token)
             response = await self._send(method, path, **kwargs)
         if not response.is_success:
             raise LightdashError(response.status_code, _error_message(response))
