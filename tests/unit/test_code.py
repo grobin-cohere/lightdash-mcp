@@ -8,11 +8,11 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 from mcp.server.mcpserver.exceptions import ToolError
 
-from kizaru_mcp.config import Settings
-from kizaru_mcp.lightdash import LightdashClient
-from kizaru_mcp.server import asgi_app, create_server
-from kizaru_mcp.tools.code import _require, check_chart, check_dashboard, preview, save
-from kizaru_mcp.tools.common import resolve_chart
+from lightdash_mcp.config import Settings
+from lightdash_mcp.lightdash import LightdashClient
+from lightdash_mcp.server import asgi_app, create_server
+from lightdash_mcp.tools.code import _require, check_chart, check_dashboard, preview, save
+from lightdash_mcp.tools.common import resolve_chart
 
 LIGHTDASH = "http://lightdash.test"
 PROJECT = "3675b69e-8324-4110-bdca-059031aa8da3"

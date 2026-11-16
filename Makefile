@@ -1,7 +1,7 @@
 LIGHTDASH_VERSION ?= 3.93.6
 LIGHTDASH_DIR := .lightdash
 DEMO_DIR := $(LIGHTDASH_DIR)/examples/full-jaffle-shop-demo
-COMPOSE := LIGHTDASH_VERSION=$(LIGHTDASH_VERSION) docker compose -p kizaru-mcp-lightdash \
+COMPOSE := LIGHTDASH_VERSION=$(LIGHTDASH_VERSION) docker compose -p lightdash-mcp-lightdash \
 	-f $(DEMO_DIR)/docker-compose.yml -f dev/lightdash.compose.yml
 
 .PHONY: dev mcp lightdash wait test lint logs stop clean
@@ -9,7 +9,7 @@ COMPOSE := LIGHTDASH_VERSION=$(LIGHTDASH_VERSION) docker compose -p kizaru-mcp-l
 dev: lightdash wait .env mcp
 
 mcp:
-	uv run kizaru-mcp
+	uv run lightdash-mcp
 
 $(DEMO_DIR):
 	git clone -q --depth 1 --branch $(LIGHTDASH_VERSION) --filter=blob:none --sparse \

@@ -39,7 +39,7 @@ A client registered with `client_secret_basic` may send its ID only in the `Auth
 
 ## Storage
 
-Redis keys are `kizaru-mcp:{client,transaction,code,access,refresh,grant}:<id>`. Token keys are sha256 digests of the tokens, and every value is encrypted with `FERNET_KEY`. Everything expires: client registrations 30 days after their last use, sign-in requests in 10 minutes, codes in 5, tokens and grants with their lifetimes. A grant lasts 10 minutes until its client exchanges the code, so an unfinished sign-in doesn't keep the Lightdash tokens.
+Redis keys are `lightdash-mcp:{client,transaction,code,access,refresh,grant}:<id>`. Token keys are sha256 digests of the tokens, and every value is encrypted with `FERNET_KEY`. Everything expires: client registrations 30 days after their last use, sign-in requests in 10 minutes, codes in 5, tokens and grants with their lifetimes. A grant lasts 10 minutes until its client exchanges the code, so an unfinished sign-in doesn't keep the Lightdash tokens.
 
 ## Errors
 
@@ -53,7 +53,7 @@ Redis keys are `kizaru-mcp:{client,transaction,code,access,refresh,grant}:<id>`.
 
 ## Logs
 
-Every tool call is logged at INFO on the `kizaru_mcp.audit` logger: the user's Lightdash UUID, the tool, its arguments, and whether it failed. The SDK also logs each tool error's message, and the traceback of unexpected exceptions.
+Every tool call is logged at INFO on the `lightdash_mcp.audit` logger: the user's Lightdash UUID, the tool, its arguments, and whether it failed. The SDK also logs each tool error's message, and the traceback of unexpected exceptions.
 
 ```
 user=b264d83a-9000-426a-85ec-3f9c20f368ce tool=revoke_project_access arguments={"project_uuid": "3675b69e-...", "user_uuid": "...", "dry_run": false} error=False

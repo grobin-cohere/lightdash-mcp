@@ -1,5 +1,5 @@
 [project]
-name = "kizaru-mcp"
+name = "lightdash-mcp"
 version = "0.2.0"
 description = "MCP server for Lightdash: data queries, admin, governance and content lifecycle"
 readme = "README.md"
@@ -18,11 +18,11 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/ntrossat/kizaru-mcp"
-Issues = "https://github.com/ntrossat/kizaru-mcp/issues"
+Repository = "https://github.com/grobin-cohere/lightdash-mcp"
+Issues = "https://github.com/grobin-cohere/lightdash-mcp/issues"
 
 [project.scripts]
-kizaru-mcp = "kizaru_mcp.server:main"
+lightdash-mcp = "lightdash_mcp.server:main"
 
 [dependency-groups]
 dev = [

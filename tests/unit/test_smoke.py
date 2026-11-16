@@ -6,18 +6,18 @@ from fakeredis import FakeAsyncRedis
 from mcp.server.mcpserver.exceptions import ToolError
 from redis.asyncio import Redis
 
-from kizaru_mcp.config import Settings
-from kizaru_mcp.lightdash import LightdashClient, LightdashError
-from kizaru_mcp.server import create_server
-from kizaru_mcp.tools.content import _content
-from kizaru_mcp.tools.data import _explores
+from lightdash_mcp.config import Settings
+from lightdash_mcp.lightdash import LightdashClient, LightdashError
+from lightdash_mcp.server import create_server
+from lightdash_mcp.tools.content import _content
+from lightdash_mcp.tools.data import _explores
 
 
 def test_create_server():
     settings = Settings(
         _env_file=None, lightdash_client_id="id", lightdash_client_secret="secret", fernet_key=Fernet.generate_key().decode()
     )
-    assert create_server(settings).name == "kizaru-mcp"
+    assert create_server(settings).name == "lightdash-mcp"
 
 
 async def test_tool_arguments_cannot_reach_other_endpoints():

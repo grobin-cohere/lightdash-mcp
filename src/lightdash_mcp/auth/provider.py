@@ -27,8 +27,8 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from kizaru_mcp.auth.store import LOCK_TIMEOUT, Store, digest
-from kizaru_mcp.config import Settings
+from lightdash_mcp.auth.store import LOCK_TIMEOUT, Store, digest
+from lightdash_mcp.config import Settings
 
 SCOPE = "lightdash"
 LIGHTDASH_SCOPE = "read write"
@@ -39,7 +39,7 @@ REFRESH_TTL = 14 * 24 * 60 * 60  # Lightdash's refresh-token lifetime
 REFRESH_MARGIN = 60
 REFRESH_TIMEOUT = LOCK_TIMEOUT - 10  # a refresh ends while it still holds the grant's lock
 CLIENT_TTL = 30 * 24 * 60 * 60  # renewed on use: registration is open, so unused clients must expire
-CONSENT_COOKIE = "kizaru_mcp_consent"  # one per transaction, suffixed with its digest
+CONSENT_COOKIE = "lightdash_mcp_consent"  # one per transaction, suffixed with its digest
 
 
 class SignInRequired(Exception):

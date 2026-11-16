@@ -279,10 +279,10 @@ async def test_saved_content_tools(viewer, tool, project_uuid, filtered_dashboar
 
 
 async def test_tool_calls_are_logged(admin, tool, project_uuid, caplog):
-    caplog.set_level(logging.INFO, logger="kizaru_mcp.audit")
+    caplog.set_level(logging.INFO, logger="lightdash_mcp.audit")
     ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
     denied(await tool(admin, "list_spaces", {"project_uuid": "00000000-0000-4000-8000-000000000000"}))
-    lines = [r.getMessage() for r in caplog.records if r.name == "kizaru_mcp.audit"]
+    lines = [r.getMessage() for r in caplog.records if r.name == "lightdash_mcp.audit"]
     assert len(lines) == 2 and all("tool=list_spaces" in line and "user=None" not in line for line in lines)
     assert f'"project_uuid": "{project_uuid}"' in lines[0] and lines[0].endswith("error=False")
     assert lines[1].endswith("error=True")

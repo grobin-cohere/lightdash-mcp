@@ -17,7 +17,7 @@ An organization admin registers it in Lightdash:
 1. Open **Settings → OAuth applications** (`<LIGHTDASH_URL>/generalSettings/oauthClients`).
 2. Click **Register new OAuth application**.
 3. Fill in:
-   - **Application name**: `Kizaru`, or any name. Users see it when they sign in.
+   - **Application name**: `lightdash-mcp`, or any name. Users see it when they sign in.
    - **Redirect URI**: `<PUBLIC_URL>/oauth/lightdash/callback`
 4. Click **Register application**.
 5. Copy the **Client ID** into `LIGHTDASH_CLIENT_ID` and the **Client secret** into `LIGHTDASH_CLIENT_SECRET`. The secret is shown only once.
@@ -31,7 +31,7 @@ Lightdash registration is also open to anyone, without signing in:
 ```bash
 curl -X POST "$LIGHTDASH_URL/api/v1/oauth/register" \
   -H 'Content-Type: application/json' \
-  -d '{"client_name":"kizaru-mcp","redirect_uris":["<PUBLIC_URL>/oauth/lightdash/callback"],"scope":"read write"}'
+  -d '{"client_name":"lightdash-mcp","redirect_uris":["<PUBLIC_URL>/oauth/lightdash/callback"],"scope":"read write"}'
 ```
 
 Keep the `client_id` and `client_secret` it returns. Lightdash accepts `http://localhost` redirect URIs.
@@ -64,19 +64,13 @@ The server stops with `Missing settings: ...` when a required variable is empty.
 
 ```bash
 uv sync
-uv run kizaru-mcp
-```
-
-Or run the package from PyPI, from the directory with `.env`:
-
-```bash
-uvx kizaru-mcp
+uv run lightdash-mcp
 ```
 
 Or with Docker, which listens on `0.0.0.0` inside the container:
 
 ```bash
-docker run --env-file .env -p 8000:8000 ghcr.io/ntrossat/kizaru-mcp
+docker run --env-file .env -p 8000:8000 ghcr.io/grobin-cohere/lightdash-mcp
 ```
 
 Inside the container, `localhost` is the container itself. Point `REDIS_URL` at an address the container can reach, such as `redis://host.docker.internal:6379/0` for Redis on the host. `LIGHTDASH_URL` must be reachable from both the container and your browser, which signs in there.
