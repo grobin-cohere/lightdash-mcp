@@ -6,7 +6,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 
 | Module | Owns |
 | --- | --- |
-| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the audit log, allowed hosts |
+| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the audit log, allowed hosts, and the Basic-header fix on `/token` |
 | `config.py` | Settings from the environment |
 | `auth/provider.py` | The OAuth provider: clients, consent page, Lightdash callback, codes and tokens, upstream refresh |
 | `auth/store.py` | Encrypted Redis storage and locks |
@@ -14,6 +14,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 | `tools/common.py` | A Lightdash client for the signed-in user, error mapping, tool annotations |
 | `tools/access.py` | Users, groups, roles, project and space access |
 | `tools/content.py` | Finding charts and dashboards, reading dashboards, unused content, validation errors, moving and deleting content |
+| `tools/code.py` | Charts and dashboards as code: reading them, checking them, creating and replacing them |
 | `tools/schedulers.py` | Scheduled deliveries |
 | `tools/data.py` | Explores, fields, metric queries and saved charts |
 
@@ -24,6 +25,8 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 3. On **Allow**, the server redirects to Lightdash's `/authorize` with its own PKCE and the saved request's id as `state`.
 4. Lightdash signs the user in and returns to `/oauth/lightdash/callback`. The callback only goes on in the browser that approved the consent page, checked with the same cookie (once approved, the consent page no longer opens, so no other browser can get a new one), so a Lightdash link taken from someone else's consent can't send this user's sign-in to another client. The server exchanges the code, reads the user from `/api/v1/user`, creates a grant, and returns its own single-use code to the client. If Lightdash fails, the client gets `error=server_error`.
 5. The client exchanges that code, with its PKCE verifier, for the server's tokens.
+
+A client registered with `client_secret_basic` may send its ID only in the `Authorization` header, as RFC 6749 section 2.3.1 allows; Dex does, so North's MCP connectors do. The MCP SDK's token endpoint also requires `client_id` in the form body, so `BasicAuthClientId` copies it there from the header. The SDK still checks the secret.
 
 ## Grants and tokens
 
@@ -36,7 +39,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 
 ## Storage
 
-Redis keys are `kizaru-mcp:{client,transaction,code,access,refresh,grant}:<id>`. Token keys are sha256 digests of the tokens, and every value is encrypted with `FERNET_KEY`. Everything expires: client registrations 30 days after their last use, sign-in requests in 10 minutes, codes in 5, tokens and grants with their lifetimes. A grant lasts 10 minutes until its client exchanges the code, so an unfinished sign-in doesn't keep the Lightdash tokens.
+Redis keys are `lightdash-mcp:{client,transaction,code,access,refresh,grant}:<id>`. Token keys are sha256 digests of the tokens, and every value is encrypted with `FERNET_KEY`. Everything expires: client registrations 30 days after their last use, sign-in requests in 10 minutes, codes in 5, tokens and grants with their lifetimes. A grant lasts 10 minutes until its client exchanges the code, so an unfinished sign-in doesn't keep the Lightdash tokens.
 
 ## Errors
 
@@ -50,7 +53,7 @@ Redis keys are `kizaru-mcp:{client,transaction,code,access,refresh,grant}:<id>`.
 
 ## Logs
 
-Every tool call is logged at INFO on the `kizaru_mcp.audit` logger: the user's Lightdash UUID, the tool, its arguments, and whether it failed. The SDK also logs each tool error's message, and the traceback of unexpected exceptions.
+Every tool call is logged at INFO on the `lightdash_mcp.audit` logger: the user's Lightdash UUID, the tool, its arguments, and whether it failed. The SDK also logs each tool error's message, and the traceback of unexpected exceptions.
 
 ```
 user=b264d83a-9000-426a-85ec-3f9c20f368ce tool=revoke_project_access arguments={"project_uuid": "3675b69e-...", "user_uuid": "...", "dry_run": false} error=False
