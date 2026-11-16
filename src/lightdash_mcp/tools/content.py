@@ -2,7 +2,6 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from itertools import count
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -11,27 +10,24 @@ from mcp.server.mcpserver.exceptions import ToolError
 from lightdash_mcp.auth.provider import LightdashOAuthProvider
 from lightdash_mcp.lightdash import LightdashClient
 from lightdash_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, lightdash
+from lightdash_mcp.tools.shared import every_page
 
 ContentType = Literal["chart", "dashboard", "space"]
 
-PAGE_SIZE = 100
 VALIDATION_TIMEOUT = 120
 
 
 async def _content(ld: LightdashClient, project_uuid: str, **params: Any) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for page in count(1):
-        results = await ld.get("/api/v2/content", projectUuids=project_uuid, pageSize=PAGE_SIZE, page=page, **params)
-        items += results["data"]
-        if page >= results["pagination"]["totalPageCount"]:
-            return items
+    return await every_page(ld, "/api/v2/content", projectUuids=project_uuid, **params)
 
 
 async def _item(ld: LightdashClient, project_uuid: str, content_type: ContentType, uuid: str) -> dict[str, Any]:
+    # Check the UUID rather than trust the filter: deleting the wrong space deletes everything in it.
     items = await _content(ld, project_uuid, uuids=uuid, contentTypes=content_type)
-    if not items:
+    item = next((i for i in items if i["uuid"] == uuid.lower() and i["contentType"] == content_type), None)
+    if item is None:
         raise ToolError(f"No {content_type} {uuid} in this project.")
-    return items[0]
+    return item
 
 
 def _payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -45,9 +41,38 @@ def _summary(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "contentType": item["contentType"],
         "uuid": item["uuid"],
+        "slug": item.get("slug"),
         "name": item["name"],
         "space": (item.get("space") or {}).get("name"),
     }
+
+
+def unused_content(items: list[dict[str, Any]], unused_days: int) -> list[dict[str, Any]]:
+    cutoff = datetime.now(UTC) - timedelta(days=unused_days)
+
+    def before_cutoff(value: str) -> bool:
+        return datetime.fromisoformat(value) < cutoff
+
+    def unused(item: dict[str, Any]) -> bool:
+        if not before_cutoff(item["createdAt"]):
+            return False
+        if item.get("lastViewedAt"):
+            return before_cutoff(item["lastViewedAt"])
+        # Lightdash leaves lastViewedAt null for some content it counts views of (ContentModel), so null alone
+        # doesn't mean never viewed.
+        return not item.get("views")
+
+    found = sorted(filter(unused, items), key=lambda i: (i.get("lastViewedAt") or "", i["createdAt"]))
+    return [
+        {
+            **_summary(i),
+            "views": i.get("views"),
+            "lastViewedAt": i.get("lastViewedAt"),
+            "createdAt": i["createdAt"],
+            "lastUpdatedAt": i.get("lastUpdatedAt"),
+        }
+        for i in found
+    ]
 
 
 def _tile(tile: dict[str, Any], tabs: dict[str, str]) -> dict[str, Any]:
@@ -56,7 +81,11 @@ def _tile(tile: dict[str, Any], tabs: dict[str, str]) -> dict[str, Any]:
     if tabs:
         summary["tab"] = tabs.get(tile.get("tabUuid"))
     if tile["type"] == "saved_chart":
-        summary |= {"chartUuid": properties.get("savedChartUuid"), "chartKind": properties.get("lastVersionChartKind")}
+        summary |= {
+            "chartUuid": properties.get("savedChartUuid"),
+            "chartSlug": properties.get("chartSlug"),
+            "chartKind": properties.get("lastVersionChartKind"),
+        }
     elif tile["type"] == "markdown":
         summary["content"] = properties.get("content")
     return summary
@@ -88,6 +117,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         filters = dashboard.get("filters") or {}
         return {
             "name": dashboard["name"],
+            "slug": dashboard.get("slug"),
             "description": dashboard.get("description"),
             "projectUuid": dashboard["projectUuid"],
             "space": dashboard.get("spaceName"),
@@ -108,26 +138,11 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         project_uuid: Uuid, unused_days: int = 90, content_type: Literal["chart", "dashboard"] | None = None
     ) -> list[dict[str, Any]]:
         """Find charts and dashboards nobody has viewed in `unused_days` days, never-viewed first.
-        Content created within that window is left out."""
-        cutoff = datetime.now(UTC) - timedelta(days=unused_days)
+        Content created within that window is left out, and so is viewed content whose last view date
+        Lightdash doesn't record."""
         async with lightdash(provider) as ld:
             items = await _content(ld, project_uuid, contentTypes=content_type or ["chart", "dashboard"])
-
-        def before_cutoff(value: str | None) -> bool:
-            return value is None or datetime.fromisoformat(value) < cutoff
-
-        unused = [i for i in items if before_cutoff(i.get("lastViewedAt")) and before_cutoff(i["createdAt"])]
-        unused.sort(key=lambda i: (i.get("lastViewedAt") is not None, i.get("lastViewedAt") or "", i["createdAt"]))
-        return [
-            {
-                **_summary(i),
-                "views": i.get("views"),
-                "lastViewedAt": i.get("lastViewedAt"),
-                "createdAt": i["createdAt"],
-                "lastUpdatedAt": i.get("lastUpdatedAt"),
-            }
-            for i in unused
-        ]
+        return unused_content(items, unused_days)
 
     @server.tool(annotations=READ)
     async def list_validation_errors(project_uuid: Uuid, revalidate: bool = False) -> list[dict[str, Any]]:

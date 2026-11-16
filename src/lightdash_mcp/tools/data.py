@@ -1,6 +1,7 @@
 """Data: explores, their fields, metric queries on the semantic layer, and saved charts."""
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any, Literal
 
@@ -36,6 +37,8 @@ Operator = Literal[
 
 MAX_ROWS = 2500  # Lightdash's default largest results page
 QUERY_TIMEOUT = 120
+CANCEL_TIMEOUT = 10
+RUNNING = ("pending", "queued", "executing")
 
 
 class Filter(BaseModel):
@@ -54,8 +57,15 @@ def _field_id(field: dict[str, Any]) -> str:
     return f"{field['table']}_{field['name'].replace('.', '__')}"
 
 
-def _fields(explore: dict[str, Any], kind: Literal["dimensions", "metrics"]) -> dict[str, dict[str, Any]]:
-    return {_field_id(f): f for table in explore["tables"].values() for f in table[kind].values() if not f.get("hidden")}
+def explore_fields(
+    explore: dict[str, Any], kind: Literal["dimensions", "metrics"], include_hidden: bool = False
+) -> dict[str, dict[str, Any]]:
+    return {
+        _field_id(f): f
+        for table in explore["tables"].values()
+        for f in table[kind].values()
+        if include_hidden or not f.get("hidden")
+    }
 
 
 def _summary(field: dict[str, Any]) -> dict[str, Any]:
@@ -68,7 +78,7 @@ def _summary(field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _explore(ld: LightdashClient, project_uuid: str, explore: str) -> dict[str, Any]:
+async def load_explore(ld: LightdashClient, project_uuid: str, explore: str) -> dict[str, Any]:
     found = await ld.get(f"/api/v1/projects/{project_uuid}/explores/{explore}")
     if "tables" not in found:
         raise ToolError(f"Explore {explore} has errors: {found.get('errors')}")
@@ -90,14 +100,18 @@ async def _run(ld: LightdashClient, project_uuid: str, endpoint: str, body: dict
     """Start a Lightdash query, wait for it, and return its first page of results."""
     started = await ld.request("POST", f"/api/v2/projects/{project_uuid}/query/{endpoint}", json=body | {"context": "api"})
     path = f"/api/v2/projects/{project_uuid}/query/{started['queryUuid']}"
-    for _ in range(QUERY_TIMEOUT * 2):
-        results = await ld.get(path, pageSize=page_size)
-        if results["status"] not in ("pending", "queued", "executing"):
-            break
-        await asyncio.sleep(0.5)
-    else:
-        await ld.request("POST", f"{path}/cancel")
-        raise ToolError(f"The query took more than {QUERY_TIMEOUT} seconds and was cancelled.")
+    try:
+        async with asyncio.timeout(QUERY_TIMEOUT):
+            while (results := await ld.get(path, pageSize=page_size))["status"] in RUNNING:
+                await asyncio.sleep(0.5)
+    except BaseException as error:
+        # Timed out, failed to poll or cancelled by the client: don't leave the query running in the warehouse.
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(CANCEL_TIMEOUT):
+                await ld.request("POST", f"{path}/cancel")
+        if isinstance(error, TimeoutError):
+            raise ToolError(f"The query took more than {QUERY_TIMEOUT} seconds and was cancelled.") from None
+        raise
     if results["status"] != "ready":
         raise ToolError(f"The query failed ({results['status']}): {results.get('error')}")
     return results
@@ -141,14 +155,14 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """List an explore's dimensions and metrics, joined tables included. Their field IDs go into run_query.
         Date dimensions come with one field per interval, such as orders_order_date_month."""
         async with lightdash(provider) as ld:
-            found = await _explore(ld, project_uuid, explore)
+            found = await load_explore(ld, project_uuid, explore)
         base = found["tables"][found["baseTable"]]
         return {
             "name": found["name"],
             "label": found.get("label"),
             "description": base.get("description"),
-            "dimensions": [_summary(f) for f in _fields(found, "dimensions").values()],
-            "metrics": [_summary(f) for f in _fields(found, "metrics").values()],
+            "dimensions": [_summary(f) for f in explore_fields(found, "dimensions").values()],
+            "metrics": [_summary(f) for f in explore_fields(found, "metrics").values()],
         }
 
     @server.tool(annotations=READ)
@@ -169,8 +183,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         if not dimensions and not metrics:
             raise ToolError("Give at least one dimension or metric.")
         async with lightdash(provider) as ld:
-            found = await _explore(ld, project_uuid, explore)
-            known_dimensions, known_metrics = _fields(found, "dimensions"), _fields(found, "metrics")
+            found = await load_explore(ld, project_uuid, explore)
+            known_dimensions, known_metrics = explore_fields(found, "dimensions"), explore_fields(found, "metrics")
             unknown = [
                 f
                 for f in [*dimensions, *metrics, *(f.field_id for f in filters), *(s.field_id for s in sorts)]
