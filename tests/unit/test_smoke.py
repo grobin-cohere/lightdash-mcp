@@ -10,6 +10,7 @@ from kizaru_mcp.config import Settings
 from kizaru_mcp.lightdash import LightdashClient, LightdashError
 from kizaru_mcp.server import create_server
 from kizaru_mcp.tools.content import _content
+from kizaru_mcp.tools.data import _explores
 
 
 def test_create_server():
@@ -94,6 +95,19 @@ async def test_content_reads_every_page():
         client = LightdashClient(http, "token")
         items = await _content(client, "project")
     assert [i["uuid"] for i in items] == [str(n) for n in range(1, 61)]
+
+
+@respx.mock
+async def test_explores_follow_the_tables_configuration():
+    def explores(request):
+        # Lightdash leaves out the explores that the tables configuration hides only with filtered=true.
+        hidden = [] if request.url.params.get("filtered") == "true" else [{"name": "stg_orders"}]
+        return httpx.Response(200, json={"results": [{"name": "orders", "label": "Orders", "groupLabel": "Sales"}, *hidden]})
+
+    respx.get("http://lightdash.test/api/v1/projects/project/explores").mock(side_effect=explores)
+    async with httpx.AsyncClient(base_url="http://lightdash.test") as http:
+        found = await _explores(LightdashClient(http, "token"), "project")
+    assert found == [{"name": "orders", "label": "Orders", "group": "Sales", "description": None}]
 
 
 async def test_health_follows_redis():
