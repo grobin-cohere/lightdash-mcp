@@ -13,7 +13,7 @@ registered = (
     httpx.post(
         f"{LIGHTDASH}/api/v1/oauth/register",
         json={
-            "client_name": "kizaru-mcp",
+            "client_name": "lightdash-mcp",
             "redirect_uris": ["http://localhost:8000/oauth/lightdash/callback"],
             "scope": "read write",
         },

@@ -10,7 +10,7 @@ from redis.asyncio.lock import Lock
 
 M = TypeVar("M", bound=BaseModel)
 
-PREFIX = "kizaru-mcp"
+PREFIX = "lightdash-mcp"
 LOCK_TIMEOUT = 30
 
 

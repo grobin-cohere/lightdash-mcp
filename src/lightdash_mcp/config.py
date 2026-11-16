@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     host: str = "127.0.0.1"
     port: int = 8000
+    # Lifetime of the access tokens this server issues. Clients that don't refresh them, such as Dex's
+    # OAuth connector, need a longer one. At most 14 days, the refresh-token lifetime.
+    access_token_ttl: int = Field(default=60 * 60, ge=60, le=14 * 24 * 60 * 60)
 
     @field_validator("lightdash_url", "public_url")
     @classmethod
