@@ -50,7 +50,7 @@ Tools: `list_projects`, `list_validation_errors`
 
 > Give alice@example.com editor access to Jaffle Shop.
 
-Tools: `list_projects`, `grant_project_access`
+Tools: `list_projects`, `grant_project_access` (a dry run first shows Alice's current access, then the grant runs with `dry_run=false`)
 
 ![Claude granting editor access](use-cases/6-grant-access.jpg)
 

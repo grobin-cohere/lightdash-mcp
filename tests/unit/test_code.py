@@ -11,7 +11,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from lightdash_mcp.config import Settings
 from lightdash_mcp.lightdash import LightdashClient
 from lightdash_mcp.server import asgi_app, create_server
-from lightdash_mcp.tools.code import _require, check_chart, check_dashboard, preview, save
+from lightdash_mcp.tools.code import _require, check_chart, check_dashboard, keep_existing, preview, save
 from lightdash_mcp.tools.common import resolve_chart
 
 LIGHTDASH = "http://lightdash.test"
@@ -27,7 +27,10 @@ EXPLORE = {
                 "status": {"table": "orders", "name": "status"},
                 "order_date_week": {"table": "orders", "name": "order_date_week"},
             },
-            "metrics": {"revenue": {"table": "orders", "name": "revenue"}},
+            "metrics": {
+                "revenue": {"table": "orders", "name": "revenue"},
+                "cost": {"table": "orders", "name": "cost", "hidden": True},
+            },
         }
     },
 }
@@ -52,7 +55,7 @@ CHART = {
 }
 
 
-def mock_lightdash(existing: list[dict] | None = None, spaces: list[str] = ("my-team",), missing: list[str] = ()):
+def mock_lightdash(existing: list[dict] | None = None, spaces: list[str] = ("my_team",), missing: list[str] = ()):
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/explores/orders").mock(
         return_value=httpx.Response(200, json={"results": EXPLORE})
     )
@@ -61,7 +64,7 @@ def mock_lightdash(existing: list[dict] | None = None, spaces: list[str] = ("my-
             return_value=httpx.Response(200, json={"results": {kind: existing or [], "missingIds": list(missing)}})
         )
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/spaces").mock(
-        return_value=httpx.Response(200, json={"results": [{"slug": slug} for slug in spaces]})
+        return_value=httpx.Response(200, json={"results": [{"slug": path.split(".")[-1], "path": path} for path in spaces]})
     )
 
 
@@ -80,11 +83,38 @@ async def test_chart_fields_must_exist_in_the_explore():
             await check_chart(ld, PROJECT, CHART | {"metricQuery": query})
 
 
+@respx.mock
+async def test_charts_can_use_hidden_fields():
+    mock_lightdash()
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        await check_chart(
+            await client(http), PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | {"metrics": ["orders_cost"]}}
+        )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ({"tableCalculations": [{"sql": "1"}]}, "Each of metricQuery.tableCalculations needs name"),
+        ({"sorts": [{"descending": True}]}, "Each of metricQuery.sorts needs fieldId"),
+        ({"additionalMetrics": [{"name": "x"}]}, "Each of metricQuery.additionalMetrics needs table and name"),
+        ({"dimensions": [{"fieldId": "orders_status"}]}, "metricQuery.dimensions must be a list of field IDs"),
+    ],
+)
+async def test_malformed_charts_are_refused_with_a_reason(change, error):
+    mock_lightdash()
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        with pytest.raises(ToolError, match=error):
+            await check_chart(await client(http), PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | change})
+
+
 def test_charts_need_their_keys_and_a_url_safe_slug():
     with pytest.raises(ToolError, match="needs chartConfig"):
         _require({k: v for k, v in CHART.items() if k != "chartConfig"}, ("name", "slug", "chartConfig"), "chart")
-    with pytest.raises(ToolError, match="Invalid slug"):
-        _require(CHART | {"slug": "../../org"}, ("slug",), "chart")
+    for slug in ("../../org", "revenue\n", "Revenue"):
+        with pytest.raises(ToolError, match="Invalid slug"):
+            _require(CHART | {"slug": slug}, ("slug",), "chart")
 
 
 @respx.mock
@@ -92,14 +122,15 @@ async def test_preview_says_whether_it_creates_or_replaces():
     mock_lightdash(spaces=[])
     async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
         ld = await client(http)
-        created = await preview(ld, PROJECT, "charts", CHART)
+        created = await preview(ld, PROJECT, "charts", CHART, None)
     assert created["wouldCreate"]["slug"] == "revenue-per-week"
     assert "visible only to you" in created["wouldCreate"]["newSpace"]
 
     respx.reset()
-    mock_lightdash(existing=[{"name": "Old revenue", "spaceSlug": "finance", "updatedAt": "2026-11-01"}])
+    mock_lightdash()
+    existing = CHART | {"name": "Old revenue", "spaceSlug": "finance", "updatedAt": "2026-11-01", "version": 1}
     async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        replaced = await preview(await client(http), PROJECT, "charts", CHART)
+        replaced = await preview(await client(http), PROJECT, "charts", CHART, existing)
     assert replaced["next"].startswith("Nothing is saved yet. Call save_chart again with dry_run=false")
     assert {k: v for k, v in replaced.items() if k != "next"} == {
         "wouldUpdate": {
@@ -107,15 +138,58 @@ async def test_preview_says_whether_it_creates_or_replaces():
             "name": "Revenue per week",
             "space": "my-team",
             "replaces": {"name": "Old revenue", "space": "finance", "updatedAt": "2026-11-01"},
+            "changes": ["name", "spaceSlug"],
         }
     }
 
 
 @respx.mock
-async def test_save_keeps_new_spaces_private_and_validates():
-    upsert = respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/code/charts/revenue-per-week").mock(
-        return_value=httpx.Response(200, json={"results": {"charts": [{"action": "create", "data": {"uuid": CHART_UUID}}]}})
+async def test_nested_spaces_are_found_by_their_path():
+    mock_lightdash(spaces=["finance", "finance.my_team"])
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        ld = await client(http)
+        nested = await preview(ld, PROJECT, "charts", CHART | {"spaceSlug": "finance/my-team"}, None)
+        top_level = await preview(ld, PROJECT, "charts", CHART | {"spaceSlug": "my-team"}, None)
+    assert "newSpace" not in nested["wouldCreate"]
+    assert "newSpace" in top_level["wouldCreate"]
+
+
+@respx.mock
+async def test_replacing_a_dashboard_keeps_what_it_leaves_out():
+    tile = {"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": {"content": "Hi"}}
+    filters = {"dimensions": [{"target": {"fieldId": "orders_status"}, "operator": "equals"}], "metrics": []}
+    existing = {
+        "name": "Sales",
+        "slug": "sales",
+        "spaceSlug": "my-team",
+        "tiles": [tile, tile],
+        "tabs": [{"uuid": "t1", "name": "Overview", "order": 0}],
+        "filters": filters,
+        "description": "Weekly sales",
+        "updatedAt": "2026-11-01",
+    }
+    given = {"name": "Sales", "slug": "sales", "spaceSlug": "my-team", "tiles": [tile]}
+    item = keep_existing("dashboards", {"version": 1, **given}, existing)
+    assert (item["tabs"], item["filters"], item["description"]) == (existing["tabs"], filters, "Weekly sales")
+    assert keep_existing("dashboards", given | {"tabs": []}, existing)["tabs"] == []
+
+    mock_lightdash()
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        result = await preview(await client(http), PROJECT, "dashboards", item, existing)
+    assert result["wouldUpdate"]["changes"] == ["tiles"]
+    assert result["wouldUpdate"]["before"] == {"tiles": 2, "tabs": 1, "filters": 1}
+    assert result["wouldUpdate"]["after"] == {"tiles": 1, "tabs": 1, "filters": 1}
+
+
+def mock_upsert(action: str = "update"):
+    return respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/code/charts/revenue-per-week").mock(
+        return_value=httpx.Response(200, json={"results": {"charts": [{"action": action, "data": {"uuid": CHART_UUID}}]}})
     )
+
+
+@respx.mock
+async def test_save_keeps_new_spaces_private_forces_the_update_and_validates():
+    upsert = mock_upsert()
     respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/validate/chart/{CHART_UUID}").mock(
         return_value=httpx.Response(200, json={"results": {"errors": [{"fieldName": "orders_x", "error": "no longer exists"}]}})
     )
@@ -123,12 +197,31 @@ async def test_save_keeps_new_spaces_private_and_validates():
         result = await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
     body = json.loads(upsert.calls[0].request.content)
     assert (body["publicSpaceCreate"], body["skipSpaceCreate"]) == (False, False)
+    # Lightdash skips a chart update whose name, description and slug are unchanged unless it is forced.
+    assert body["force"] is True
     assert result == {
-        "action": "create",
+        "action": "update",
         "uuid": CHART_UUID,
         "url": f"{LIGHTDASH}/projects/{PROJECT}/saved/{CHART_UUID}",
         "validationErrors": [{"field": "orders_x", "error": "no longer exists"}],
     }
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (httpx.Response(500, json={"error": {"message": "Validation crashed"}}), "couldn't validate it: Validation crashed"),
+        (httpx.ReadTimeout("timed out"), "didn't answer its validation"),
+    ],
+)
+async def test_save_reports_a_failed_validation_without_hiding_the_save(answer, reason):
+    mock_upsert("create")
+    respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/validate/chart/{CHART_UUID}").mock(side_effect=[answer])
+    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
+        result = await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
+    assert (result["action"], result["uuid"]) == ("create", CHART_UUID)
+    assert reason in result["validationFailed"] and "validationErrors" not in result
 
 
 @respx.mock
