@@ -8,9 +8,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
-from kizaru_mcp.auth.provider import LightdashOAuthProvider
-from kizaru_mcp.lightdash import LightdashClient
-from kizaru_mcp.tools.common import READ, ChartRef, Name, Uuid, lightdash, resolve_chart
+from lightdash_mcp.auth.provider import LightdashOAuthProvider
+from lightdash_mcp.lightdash import LightdashClient
+from lightdash_mcp.tools.common import READ, ChartRef, Name, Uuid, lightdash, resolve_chart
 
 Operator = Literal[
     "isNull",

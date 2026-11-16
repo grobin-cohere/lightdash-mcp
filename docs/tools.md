@@ -49,7 +49,7 @@ A filter is `{field_id, operator, values, settings}`. Filters are combined with 
 
 ## Build
 
-Charts and dashboards as code, in the format that `lightdash download` writes and `lightdash upload` reads, so content made through Kizaru can be pulled into a repository later.
+Charts and dashboards as code, in the format that `lightdash download` writes and `lightdash upload` reads, so content made through lightdash-mcp can be pulled into a repository later.
 
 | Tool | Parameters | Does | Lightdash API |
 | --- | --- | --- | --- |
