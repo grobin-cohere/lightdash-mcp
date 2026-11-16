@@ -13,8 +13,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 
-from kizaru_mcp.auth import provider as provider_module
-from kizaru_mcp.auth.provider import (
+from lightdash_mcp.auth import provider as provider_module
+from lightdash_mcp.auth.provider import (
     CLIENT_TTL,
     REFRESH_TTL,
     TRANSACTION_TTL,
@@ -26,9 +26,9 @@ from kizaru_mcp.auth.provider import (
     Transaction,
     _consent_cookie,
 )
-from kizaru_mcp.auth.store import Store, digest
-from kizaru_mcp.config import Settings
-from kizaru_mcp.tools.common import RECONNECT, lightdash
+from lightdash_mcp.auth.store import Store, digest
+from lightdash_mcp.config import Settings
+from lightdash_mcp.tools.common import RECONNECT, lightdash
 
 LIGHTDASH = "http://lightdash.test"
 TOKEN_URL = f"{LIGHTDASH}/api/v1/oauth/token"
@@ -69,7 +69,7 @@ def signed_in_as(access: Access):
 
 async def test_stored_values_are_encrypted(provider):
     await add_grant(provider, 3600)
-    raw = await provider.store._redis.get("kizaru-mcp:grant:grant")
+    raw = await provider.store._redis.get("lightdash-mcp:grant:grant")
     assert b"ld-refresh" not in raw
 
 
@@ -336,7 +336,7 @@ async def test_grant_lasts_once_its_code_is_exchanged(provider):
     )
     response = await provider.lightdash_callback(request)
     code = await provider.load_authorization_code(client, response.headers["location"].split("code=")[1])
-    grant_key = f"kizaru-mcp:grant:{code.grant_id}"
+    grant_key = f"lightdash-mcp:grant:{code.grant_id}"
     # A sign-in whose code is never exchanged doesn't keep the Lightdash tokens for long.
     assert 0 < await provider.store._redis.ttl(grant_key) <= TRANSACTION_TTL
 
@@ -349,8 +349,8 @@ async def test_tokens_copied_under_another_key_are_refused(provider):
     redis = provider.store._redis
     refresh = Refresh(token="real", client_id="client", scopes=[], grant_id="grant")
     await provider.store.put("refresh", digest("real"), refresh)
-    await redis.copy(f"kizaru-mcp:refresh:{digest('real')}", f"kizaru-mcp:refresh:{digest('forged')}")
-    await redis.copy(f"kizaru-mcp:access:{digest(access)}", f"kizaru-mcp:access:{digest('forged')}")
+    await redis.copy(f"lightdash-mcp:refresh:{digest('real')}", f"lightdash-mcp:refresh:{digest('forged')}")
+    await redis.copy(f"lightdash-mcp:access:{digest(access)}", f"lightdash-mcp:access:{digest('forged')}")
     client = OAuthClientInformationFull(client_id="client", redirect_uris=["http://localhost:9999/callback"])
     assert await provider.load_refresh_token(client, "real")
     assert await provider.load_refresh_token(client, "forged") is None
@@ -360,7 +360,7 @@ async def test_tokens_copied_under_another_key_are_refused(provider):
 async def test_clients_expire_unless_used(provider):
     client = OAuthClientInformationFull(client_id="client", redirect_uris=["http://localhost:9999/callback"])
     await provider.register_client(client)
-    key = "kizaru-mcp:client:client"
+    key = "lightdash-mcp:client:client"
     assert 0 < await provider.store._redis.ttl(key) <= CLIENT_TTL
     await provider.store._redis.expire(key, 60)
     assert await provider.get_client("client")
@@ -390,7 +390,7 @@ async def test_consent_page_shows_where_the_user_returns(provider):
 
 async def test_approved_consent_cannot_be_reopened_in_another_browser(provider):
     await consent_page(provider, "http://localhost:9999/callback")
-    transaction_id = (await provider.store._redis.keys("kizaru-mcp:transaction:*"))[0].decode().rsplit(":", 1)[1]
+    transaction_id = (await provider.store._redis.keys("lightdash-mcp:transaction:*"))[0].decode().rsplit(":", 1)[1]
     transaction = await provider.store.get("transaction", transaction_id, Transaction)
     transaction.approved = True
     await provider.store.put("transaction", transaction_id, transaction)
@@ -419,4 +419,4 @@ async def test_issued_access_tokens_follow_the_configured_lifetime(provider):
     assert issued.expires_in == 24 * 60 * 60
     access = await provider.load_access_token(issued.access_token)
     assert access.expires_at - time.time() > 23 * 60 * 60
-    assert await provider.store._redis.ttl(f"kizaru-mcp:access:{digest(issued.access_token)}") > 23 * 60 * 60
+    assert await provider.store._redis.ttl(f"lightdash-mcp:access:{digest(issued.access_token)}") > 23 * 60 * 60

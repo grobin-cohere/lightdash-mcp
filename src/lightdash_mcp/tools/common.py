@@ -9,8 +9,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from kizaru_mcp.auth.provider import Access, LightdashOAuthProvider, SignInRequired
-from kizaru_mcp.lightdash import LightdashClient, LightdashError
+from lightdash_mcp.auth.provider import Access, LightdashOAuthProvider, SignInRequired
+from lightdash_mcp.lightdash import LightdashClient, LightdashError
 
 RECONNECT = "Your Lightdash sign-in has ended. Reconnect this MCP server to sign in again."
 UNREACHABLE = "Couldn't reach Lightdash. Try again in a moment."

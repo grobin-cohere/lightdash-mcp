@@ -19,14 +19,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from kizaru_mcp.auth.provider import SCOPE, LightdashOAuthProvider
-from kizaru_mcp.auth.store import Store
-from kizaru_mcp.config import Settings
-from kizaru_mcp.tools import access, code, content, data, schedulers
+from lightdash_mcp.auth.provider import SCOPE, LightdashOAuthProvider
+from lightdash_mcp.auth.store import Store
+from lightdash_mcp.config import Settings
+from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
 
-logger = logging.getLogger("kizaru_mcp.audit")
+logger = logging.getLogger("lightdash_mcp.audit")
 
 
 async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
@@ -60,7 +60,7 @@ def create_server(settings: Settings, redis: Redis | None = None) -> MCPServer:
         await provider.http.aclose()
 
     server = MCPServer(
-        name="kizaru-mcp",
+        name="lightdash-mcp",
         instructions="Query Lightdash data, and administer it: access, content and deliveries. "
         "Every call runs as the signed-in Lightdash user, with their permissions.",
         auth_server_provider=provider,
