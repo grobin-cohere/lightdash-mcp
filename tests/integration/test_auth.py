@@ -95,7 +95,6 @@ async def test_refresh_rotates_and_revoke_ends_the_sign_in(server, tool):
     new = {**rotated.json(), "client": token["client"]}
 
     assert mcp_status(server, token["access_token"]) == 401
-    assert refresh(server, token).status_code == 400  # a refresh token works once
     assert not (await tool(new, "list_projects")).is_error
 
     revoked = httpx.post(
@@ -107,6 +106,18 @@ async def test_refresh_rotates_and_revoke_ends_the_sign_in(server, tool):
         },
     )
     assert revoked.status_code == 200
+    assert mcp_status(server, new["access_token"]) == 401
+    assert refresh(server, new).status_code == 400
+
+
+async def test_a_reused_refresh_token_ends_the_sign_in(server, tool):
+    token = sign_in(server, ADMIN)
+    rotated = refresh(server, token)
+    assert rotated.status_code == 200, rotated.text
+    new = {**rotated.json(), "client": token["client"]}
+
+    # A refresh token works once. Presented again, it may have been stolen, so the whole sign-in ends.
+    assert refresh(server, token).status_code == 400
     assert mcp_status(server, new["access_token"]) == 401
     assert refresh(server, new).status_code == 400
 
