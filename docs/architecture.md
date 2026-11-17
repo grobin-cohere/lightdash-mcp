@@ -100,7 +100,8 @@ The `lightdash_mcp.audit` logger writes one JSON object per line, so a value sen
 | `grant_created` | A Lightdash sign-in finishes | `grant`, `subject`, `client_id` |
 | `sign_in_failed` | Lightdash's code exchange or user lookup fails, at WARNING | `client_id` |
 | `refresh_failed` | A Lightdash refresh fails but keeps the grant, at WARNING | `grant`, `subject`, `client_id`, `reason` |
-| `token_revoked` | A client revokes a token | `grant`, `subject`, `client_id` |
+| `token_revoked` | A client's revocation ends a grant, once the grant is removed, before `grant_ended`. A token whose grant has already ended is revoked without a log line | `grant`, `subject`, `client_id` |
+| `revoke_busy` | A revocation fails because the grant's lock stays busy for 30 seconds, at WARNING. The grant and its tokens are kept | `grant`, `subject`, `client_id` |
 | `grant_ended` | A grant ends | `grant`, `subject`, `client_id`, `reason`: `revoked`, `lightdash_refused_refresh` or `refresh_token_reused` |
 | `lightdash_revoke_failed` | Lightdash refuses or misses a revocation, at WARNING | `grant`, `subject`, `failure` (status or error) |
 

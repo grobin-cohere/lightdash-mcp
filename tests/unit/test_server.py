@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 
 from lightdash_mcp import server as server_module
+from lightdash_mcp.auth import store as store_module
 from lightdash_mcp.auth.audit import MAX_VALUE
 from lightdash_mcp.auth.provider import Code, Grant, _challenge
 from lightdash_mcp.auth.store import Store, digest
@@ -189,6 +190,33 @@ async def test_the_audit_log_follows_a_sign_in_without_its_secrets(http, setting
     assert lines[-1]["reason"] == "revoked"
     secrets = [client["client_secret"], tokens["access_token"], tokens["refresh_token"], "ld-refresh-2", "lightdash-secret"]
     assert not [secret for secret in secrets if secret in caplog.text]
+
+
+@pytest.fixture
+def busy(redis, monkeypatch):
+    """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up after 0.1 seconds."""
+    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
+    return redis.lock("lightdash-mcp:lock:grant:grant", timeout=60)
+
+
+@respx.mock
+async def test_a_revocation_while_the_grant_is_busy_logs_no_token_revoked(settings, redis, busy, caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    respx.post(f"{LIGHTDASH}/api/v1/oauth/revoke").mock(return_value=httpx.Response(200))
+    # A busy lock fails the request: answered as an error, not raised into the test.
+    transport = httpx.ASGITransport(asgi_app(settings, redis), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as http:
+        client = await register(http)
+        tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+        async with busy:
+            failed = await http.post("/revoke", data={"token": tokens["access_token"], **credentials(client)})
+
+    assert failed.status_code >= 500, failed.text
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
+    assert [line["event"] for line in lines] == ["client_registered", "revoke_busy"]
+    assert (lines[-1]["grant"], lines[-1]["subject"], lines[-1]["client_id"]) == ("grant", "user", client["client_id"])
+    assert [r.levelno for r in caplog.records if "revoke_busy" in r.getMessage()] == [logging.WARNING]
 
 
 async def test_stopping_closes_the_http_client_and_redis(settings, redis, monkeypatch):
