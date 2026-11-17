@@ -34,7 +34,7 @@ from starlette.responses import RedirectResponse, Response
 
 from lightdash_mcp.auth import pages
 from lightdash_mcp.auth.audit import clip, record
-from lightdash_mcp.auth.store import LOCK_TIMEOUT, Store, digest
+from lightdash_mcp.auth.store import LOCK_TIMEOUT, Changed, Missing, Store, digest
 from lightdash_mcp.config import LOOPBACK_HOSTS, Settings
 
 SCOPE = "lightdash"
@@ -109,6 +109,7 @@ class Grant(BaseModel):
     code_digest: str = ""
     access_digest: str = ""
     refresh_digest: str = ""
+    revision: int = 0  # one more on each write under the grant's lock (_save)
 
 
 class LightdashTokens(BaseModel):
@@ -380,14 +381,19 @@ class LightdashOAuthProvider:
         grant_id = authorization_code.grant_id
         try:
             async with self.store.lock("grant", grant_id):
-                if not await self.store.pop("code", digest(authorization_code.code), Code):
+                code_digest = digest(authorization_code.code)
+                if not await self.store.get("code", code_digest, Code):
                     raise TokenError("invalid_grant", "Authorization code already used")
                 grant = await self.store.get("grant", grant_id, Grant)
-                if not grant or grant.code_digest != digest(authorization_code.code):
+                if not grant or grant.code_digest != code_digest:
                     raise TokenError("invalid_grant", "Sign-in ended")
-                tokens = await self._issue(grant_id, grant, authorization_code.scopes, authorization_code.resource)
+                # Deleted with the new tokens' write, so the code works again if that fails.
+                scopes, resource = authorization_code.scopes, authorization_code.resource
+                tokens = await self._issue(grant_id, grant, scopes, resource, used_code=code_digest)
+        except SignInRequired:
+            raise TokenError("invalid_grant", "Sign-in ended") from None
         except LockError:
-            # Only taking the lock raises it (Store.lock), so nothing under it has run: the code isn't used yet.
+            # The lock stayed busy, or the grant changed meanwhile: nothing was written, the code isn't used yet.
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
         return tokens
@@ -400,8 +406,9 @@ class LightdashOAuthProvider:
             return token if grant and grant.refresh_digest == token_digest and grant.client_id == client.client_id else None
         rotated = await self.store.get("rotated", token_digest, Rotated)
         if rotated and rotated.client_id == client.client_id:
-            # A refresh token works once: seen again after its exchange, it was copied. End the sign-in for every copy.
-            await self.end_grant(rotated.grant_id, "refresh_token_reused", revoke_upstream=True)
+            # A refresh token works once: seen again after its exchange, it was copied. End the sign-in for every copy,
+            # even when the grant's lock stays busy: the client won't present this token again.
+            await self.end_grant(rotated.grant_id, "refresh_token_reused", revoke_upstream=True, force=True)
         return None
 
     async def exchange_refresh_token(
@@ -418,11 +425,11 @@ class LightdashOAuthProvider:
                 try:
                     # Keeps the Lightdash sign-in alive as long as the client's, and catches a revoked one now.
                     await self._refresh_lightdash(grant_id, grant)
+                    tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
                 except SignInRequired:
-                    raise TokenError("invalid_grant", "Lightdash sign-in ended") from None
+                    raise TokenError("invalid_grant", "Sign-in ended") from None
                 except RefreshFailed as error:
                     raise TokenError(RETRY_ERROR, str(error)) from None
-                tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
         except LockError:
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
@@ -438,12 +445,15 @@ class LightdashOAuthProvider:
     async def revoke_token(self, token: Access | Refresh) -> None:
         try:
             await self.end_grant(token.grant_id, "revoked", revoke_upstream=True, revoked=token)
-        except LockError:  # only taking the lock raises it (Store.lock): nothing is revoked
+        except LockError:  # only taking the lock raises it there (Store.lock): nothing is revoked
             record("revoke_busy", logging.WARNING, grant=token.grant_id, subject=token.subject, client_id=token.client_id)
             raise
 
-    async def _issue(self, grant_id: str, grant: Grant, scopes: list[str], resource: str | None) -> OAuthToken:
-        """New tokens for the grant, written with it in one step. The caller holds the grant's lock."""
+    async def _issue(
+        self, grant_id: str, grant: Grant, scopes: list[str], resource: str | None, used_code: str | None = None
+    ) -> OAuthToken:
+        """New tokens for the grant, written with it in one step, and the `used_code` digest deleted. The caller holds
+        the grant's lock."""
         access, refresh = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         common = {"client_id": grant.client_id, "scopes": scopes, "resource": resource, "subject": grant.subject}
         access_ttl, refresh_ttl = _grant_ttl(grant, self.settings.access_token_ttl), _grant_ttl(grant)
@@ -465,9 +475,10 @@ class LightdashOAuthProvider:
         if grant.refresh_digest:
             put.append(("rotated", grant.refresh_digest, Rotated(client_id=grant.client_id, grant_id=grant_id), REFRESH_TTL))
         delete = [("access", grant.access_digest), ("refresh", grant.refresh_digest)]
+        if used_code:
+            delete.append(("code", used_code))
         grant.access_digest, grant.refresh_digest = digest(access), digest(refresh)
-        put.append(("grant", grant_id, grant, refresh_ttl))
-        await self.store.write(put, delete)
+        await self._save(grant_id, grant, put, delete)
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
@@ -528,24 +539,64 @@ class LightdashOAuthProvider:
         grant.access_token, grant.refresh_token = tokens.access_token, tokens.refresh_token
         grant.expires_at = time.time() + tokens.expires_in
         # Saved before use: Lightdash has already rotated the old refresh token.
-        await self.store.put("grant", grant_id, grant, _grant_ttl(grant))
+        try:
+            await self._save(grant_id, grant)
+        except SignInRequired, LockError:
+            await self._revoke_upstream(grant_id, grant)  # not kept, so not left working on Lightdash
+            raise
         return grant.access_token
+
+    async def _save(
+        self,
+        grant_id: str,
+        grant: Grant,
+        put: list[tuple[str, str, BaseModel, int]] | None = None,
+        delete: list[tuple[str, str]] | None = None,
+    ) -> None:
+        """Writes the grant, with `put` and `delete`, in one transaction, unless another request ended or changed it since
+        this one read it: then SignInRequired or LockError, and nothing is written. The grant's lock keeps others out
+        only until it expires, and a reused refresh token ends the grant without it (end_grant)."""
+        revision = grant.revision
+        grant.revision += 1
+        expect = ("grant", grant_id, Grant, lambda stored: stored.revision == revision)
+        try:
+            await self.store.write([*(put or []), ("grant", grant_id, grant, _grant_ttl(grant))], delete or [], expect)
+        except Missing:
+            raise SignInRequired from None
+        except Changed:
+            record("grant_changed", logging.WARNING, grant=grant_id, subject=grant.subject, client_id=grant.client_id)
+            raise LockError("Another request changed the grant after this one's lock expired") from None
 
     def _refresh_failed(self, grant_id: str, grant: Grant, reason: str) -> RefreshFailed:
         record("refresh_failed", logging.WARNING, grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
         return RefreshFailed(f"{reason}. Try again in a moment.")
 
     async def end_grant(
-        self, grant_id: str, reason: str, revoke_upstream: bool = False, revoked: Access | Refresh | None = None
+        self,
+        grant_id: str,
+        reason: str,
+        revoke_upstream: bool = False,
+        revoked: Access | Refresh | None = None,
+        force: bool = False,
     ) -> None:
-        # Under the grant's lock, so a refresh or token exchange in flight can't put the grant back.
-        async with self.store.lock("grant", grant_id):
+        """Waits for the grant's lock, so an exchange or refresh in flight finishes first and its new tokens end too.
+
+        With `force`, a lock still busy after LOCK_TIMEOUT doesn't stop it: the grant ends without the lock, and the
+        request holding it can't put the grant back (_save).
+        """
+        try:
+            async with self.store.lock("grant", grant_id):
+                grant = await self._end_grant(grant_id, reason, revoked)
+        except LockError:
+            if not force:
+                raise
             grant = await self._end_grant(grant_id, reason, revoked)
         if grant and revoke_upstream:
             await self._revoke_upstream(grant_id, grant)
 
     async def _end_grant(self, grant_id: str, reason: str, revoked: Access | Refresh | None = None) -> Grant | None:
-        """Ends the grant and its tokens, and logs the `revoked` token that ends it. The caller holds the grant's lock."""
+        """Ends the grant and its tokens, and logs the `revoked` token that ends it. The caller holds the grant's lock, or
+        ends it by force (end_grant)."""
         grant = await self.store.pop("grant", grant_id, Grant)
         if revoked and grant:
             # Logged once its grant is gone, from then on the token no longer loads, and only by the request that ended it.

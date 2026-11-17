@@ -210,23 +210,20 @@ async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(http, sett
 
 
 @respx.mock
-async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(http, settings, redis, held_lock):
+async def test_a_reused_refresh_token_while_the_grant_is_busy_ends_the_grant_at_once(http, settings, redis, held_lock):
     client = await register(http)
     first = (await exchange(http, client, await add_code(settings, redis, client))).json()
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
     revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
     assert (await refresh(http, client, first["refresh_token"])).status_code == 200
 
-    # Reuse is found while the token loads, outside the SDK's error handling: the grant can't end with its lock busy.
+    # Clients don't present a refused token again, so the grant ends now, without its lock: the request holding it
+    # can't put the grant back.
     async with held_lock:
-        failed = await refresh(http, client, first["refresh_token"])
-    assert retryable(failed), failed.text
-    assert not revoke.called
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-
-    reused = await refresh(http, client, first["refresh_token"])
+        reused = await refresh(http, client, first["refresh_token"])
     assert (reused.status_code, reused.json()["error"]) == (400, "invalid_grant")
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+    assert revoke.called
 
 
 @respx.mock

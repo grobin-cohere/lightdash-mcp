@@ -408,6 +408,71 @@ async def test_revoke_during_a_refresh_exchange_ends_the_new_tokens(provider):
     assert await provider.load_access_token(issued.access_token) is None
 
 
+def slow_lightdash(*answers: httpx.Response) -> tuple[asyncio.Event, asyncio.Event, object]:
+    """Lightdash's token endpoint: the first refresh waits for `finish` before its answer, the others answer at once."""
+    refreshing, finish, calls = asyncio.Event(), asyncio.Event(), iter(answers)
+
+    async def answer(request):
+        first, response = not refreshing.is_set(), next(calls)
+        refreshing.set()
+        if first:
+            await finish.wait()
+        return response
+
+    return refreshing, finish, answer
+
+
+@respx.mock
+async def test_a_refresh_that_outlasts_its_lock_cant_bring_back_a_revoked_grant(provider, monkeypatch):
+    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.05)
+    await add_grant(provider, 3600)
+    refresh = await refresh_of(provider)
+    refreshing, finish, answer = slow_lightdash(REFRESHED)
+    respx.post(TOKEN_URL).mock(side_effect=answer)
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+
+    exchange = asyncio.create_task(provider.exchange_refresh_token(CLIENT, refresh, []))
+    await refreshing.wait()
+    await asyncio.sleep(0.1)  # the exchange's lock expires: the revocation doesn't wait for it
+    await provider.revoke_token(refresh)
+    finish.set()
+    with pytest.raises(TokenError) as error:
+        await exchange
+
+    assert error.value.error == "invalid_grant"
+    assert await provider.store.get("grant", "grant", Grant) is None
+    # The grant's Lightdash token, then the one the exchange got and couldn't keep.
+    revoked = [call.request.content for call in revoke.calls]
+    assert len(revoked) == 2
+    assert b"token=ld-refresh-grant" in revoked[0] and b"token=ld-refresh-2" in revoked[1]
+
+
+@respx.mock
+async def test_a_refresh_that_outlasts_its_lock_keeps_the_next_requests_tokens(provider, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.05)
+    await add_grant(provider, 3600)
+    refresh = await refresh_of(provider)
+    third = httpx.Response(200, json={"access_token": "ld-access-3", "refresh_token": "ld-refresh-3", "expires_in": 3600})
+    refreshing, finish, answer = slow_lightdash(REFRESHED, third)
+    respx.post(TOKEN_URL).mock(side_effect=answer)
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+
+    exchange = asyncio.create_task(provider.exchange_refresh_token(CLIENT, refresh, []))
+    await refreshing.wait()
+    await asyncio.sleep(0.1)  # the exchange's lock expires, and a tool call refreshes the Lightdash token meanwhile
+    assert await provider.lightdash_token("grant", "ld-access-grant") == "ld-access-3"
+    finish.set()
+    with pytest.raises(TokenError) as error:
+        await exchange
+
+    assert error.value.error == "invalid_request"
+    assert (await provider.store.get("grant", "grant", Grant)).refresh_token == "ld-refresh-3"
+    assert await refresh_of(provider) == refresh
+    assert "grant_changed" in audit_events(caplog)
+    assert [b"token=ld-refresh-2" in call.request.content for call in revoke.calls] == [True]
+
+
 @respx.mock
 async def test_server_side_refresh_errors_keep_the_sign_in(provider):
     access = await add_grant(provider, 10)
