@@ -15,6 +15,8 @@ from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialWithJitterBackoff
 from redis.exceptions import LockError, RedisError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -22,12 +24,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lightdash_mcp.auth.audit import clip, clip_arguments, record
 from lightdash_mcp.auth.provider import FORM_LIMIT, GRANT_BUSY, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
-from lightdash_mcp.auth.store import Store
+from lightdash_mcp.auth.store import REDIS_RETRIES, REDIS_TIMEOUT, Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
-REDIS_TIMEOUT = 5  # seconds: a Redis that stops answering fails a request instead of hanging it
 RETRY_AFTER = 5  # seconds, for a /revoke that Redis or the grant's lock kept from finishing
 UNAVAILABLE = "This server's storage didn't answer. Try again in a moment."
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # as the SDK's token endpoint answers
@@ -55,7 +56,13 @@ async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> Han
 
 
 def create_server(settings: Settings, redis: Redis | None = None) -> MCPServer:
-    redis = redis or Redis.from_url(settings.redis_url, socket_timeout=REDIS_TIMEOUT, socket_connect_timeout=REDIS_TIMEOUT)
+    redis = redis or Redis.from_url(
+        settings.redis_url,
+        socket_timeout=REDIS_TIMEOUT,
+        socket_connect_timeout=REDIS_TIMEOUT,
+        # Explicit: without it, from_url's connections don't retry at all.
+        retry=Retry(ExponentialWithJitterBackoff(base=0.01, cap=1), retries=REDIS_RETRIES),
+    )
     store = Store(redis, settings.fernet_key)
     provider = LightdashOAuthProvider(settings, store)
 
