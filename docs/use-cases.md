@@ -1,6 +1,8 @@
 # Use cases
 
-What you can ask once lightdash-mcp is connected. Screenshots from Claude.ai on the local Lightdash demo (`make dev`).
+What you can ask once lightdash-mcp is connected. Screenshots from Claude on the local Lightdash demo (`make dev`).
+
+The screenshots were taken before the rename, when the server was called Kizaru.
 
 ## Monthly report
 
@@ -50,9 +52,11 @@ Tools: `list_projects`, `list_validation_errors`
 
 > Give alice@example.com editor access to Jaffle Shop.
 
-Tools: `list_projects`, `grant_project_access` (a dry run first shows Alice's current access, then the grant runs with `dry_run=false`)
+Tools: `list_projects`, `grant_project_access`
 
 ![Claude granting editor access](use-cases/6-grant-access.jpg)
+
+The screenshot shows an older version, which granted access in one step. Since 0.4.0, the assistant first shows a preview with Alice's current access and the grant. It applies the grant after you confirm, with `dry_run=false`.
 
 ## Deliveries
 

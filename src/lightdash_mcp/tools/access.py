@@ -233,7 +233,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     @server.tool(annotations=DESTRUCTIVE)
     async def grant_project_access(project_uuid: Uuid, email: str, role: ProjectRole, dry_run: bool = True) -> dict[str, Any]:
         """Give an organization member direct access to a project, without an email. Fails if they already have
-        a direct grant: use update_project_access to change it.
+        a direct grant, as Lightdash refuses a second one: use update_project_access to change it.
         dry_run, on by default, shows their current access and the grant. Pass dry_run=false to grant it."""
         async with lightdash(provider) as ld:
             return await grant(ld, project_uuid, email, role, dry_run)

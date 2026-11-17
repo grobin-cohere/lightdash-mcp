@@ -31,14 +31,14 @@ See [use cases with screenshots](https://github.com/grobin-cohere/lightdash-mcp/
 ## Principles
 
 - **Acts as you.** Users sign in with Lightdash. Every call runs with their own role, so the assistant can never do more than they can.
-- **Safe by default.** Deletions only preview what they would remove until confirmed, and your client asks before running them.
+- **Safe by default.** Deletions, access changes and saves only preview what they would change until confirmed, and your client asks before running them.
 - **Private tokens.** Lightdash tokens never leave the server.
 
 ## Quick start
 
 ### Try it on a local Lightdash
 
-Needs Docker and [uv](https://docs.astral.sh/uv/).
+Needs Docker, git, curl and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/grobin-cohere/lightdash-mcp && cd lightdash-mcp && make dev
@@ -67,8 +67,10 @@ Needs Python 3.15+, uv, Redis, and a Lightdash instance (tested on 3.93.6). Its 
    Or run the [Docker image](https://github.com/grobin-cohere/lightdash-mcp/pkgs/container/lightdash-mcp) instead, as in [Run](https://github.com/grobin-cohere/lightdash-mcp/blob/main/docs/configuration.md#run):
 
    ```bash
-   docker run --env-file .env -p 8000:8000 ghcr.io/grobin-cohere/lightdash-mcp
+   docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
    ```
+
+   Inside the container, `localhost` is the container itself. Set `REDIS_URL` to an address the container reaches, such as `redis://host.docker.internal:6379/0` for Redis on the host. Each release has its own image tag, and `:latest` follows the newest one.
 
 Web clients such as ChatGPT or Claude on the web can't reach `localhost`. Give the server a public HTTPS address, as in [Behind a proxy or a tunnel](https://github.com/grobin-cohere/lightdash-mcp/blob/main/docs/configuration.md#behind-a-proxy-or-a-tunnel).
 

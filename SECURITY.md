@@ -8,7 +8,7 @@ Report it privately through [GitHub's vulnerability reporting](https://github.co
 
 ## Supported versions
 
-Fixes go into `main`.
+Only the latest version is supported. Fixes go into `main` and ship in the next image version.
 
 ## Deployment
 

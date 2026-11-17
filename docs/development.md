@@ -73,8 +73,9 @@ make test
 
 | Suite | Runs against | Covers |
 | --- | --- | --- |
-| `tests/unit` | `respx` and `fakeredis` | Encryption at rest, refresh under the lock, ended sign-ins, error mapping, revocation, separate grants, the Lightdash client |
+| `tests/unit` | `respx` and `fakeredis` | Encryption at rest, records bound to their keys, refresh under the lock, refreshes of the same token coalesced into one, refresh-token reuse, grant lifetime, ended sign-ins, error mapping, revocation, separate grants, the consent page and its CSRF token, redirect URI checks, size limits, the audit log, the tools, the Lightdash client |
 | `tests/integration` | The local Lightdash and Redis database 15 | The whole sign-in over HTTP, every tool, admin against viewer, refresh, revoke, PKCE, the consent cookie |
 
+- The unit tests are in `test_auth_flow.py` (consent, callback, registration), `test_provider.py` (grants, tokens, refresh, revocation), `test_server.py` (token endpoints, audit log, Redis), `test_tools.py` and `test_code.py` (tools), and `test_smoke.py` (settings, the Lightdash client, health).
 - The integration tests register their own OAuth clients, start the server on port 8765, and sign in as `demo@` (admin) and `demo3@` (viewer). They need nothing in `.env`, and they are skipped when Lightdash is down.
 - They change the local Lightdash: they create and delete spaces and schedulers, grant and revoke access, and move a chart and back. They expect the seeded demo data, so run `make clean` and `make dev` if a run was interrupted.
