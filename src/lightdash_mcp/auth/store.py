@@ -2,6 +2,7 @@
 
 import hashlib
 from collections.abc import Iterable
+from types import TracebackType
 from typing import TypeVar
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -90,7 +91,11 @@ class Store:
 
 
 class _ReleasedOrExpiring(Lock):
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+    """A lock whose release, when Redis fails it, is left to expire. The error of the work under it still comes through."""
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         try:
             await super().__aexit__(exc_type, exc_value, traceback)
         except RedisError:

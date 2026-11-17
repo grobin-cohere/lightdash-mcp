@@ -155,17 +155,42 @@ def _basic_credentials(authorization: str) -> tuple[str, str] | None:
     return (unquote(client_id), unquote(secret)) if separator and client_id else None
 
 
-async def try_again(request: Request, error: Exception) -> Response:
-    """Redis failed or didn't answer in /token or /revoke, or a grant's lock stayed busy where the SDK catches no error:
-    in /revoke, and in /token's reuse check of a refresh token, which ends the grant. The exchanges themselves answer a
-    busy lock with a TokenError. Other paths keep the error, and a 500."""
-    if request.url.path not in ("/token", "/revoke"):
-        raise error
+class TryAgain:
+    """Answer Redis failing, or a grant's lock staying busy, in /token or /revoke with an error the client can retry.
+
+    The SDK catches only TokenError, and only around the exchanges, which answer a busy lock themselves. Redis also
+    runs in the client lookup, the token loads (also from the SDK's Bearer middleware) and /token's reuse check of a
+    refresh token. Added as the app's outermost middleware, inside its 500 handler, to see all of them. Other paths keep
+    their 500.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] not in ("/token", "/revoke"):
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked)
+        except RedisError as error:  # LockError too
+            if started:
+                raise
+            await _try_again(scope["path"], error)(scope, receive, send)
+
+
+def _try_again(path: str, error: RedisError) -> Response:
     busy = isinstance(error, LockError)
     if not busy:
-        record("storage_failed", logging.WARNING, path=request.url.path, error=type(error).__name__)
+        record("storage_failed", logging.WARNING, path=path, error=type(error).__name__)
     description = BUSY if busy else UNAVAILABLE
-    if request.url.path == "/token":
+    if path == "/token":
         content = TokenErrorResponse(error=RETRY_ERROR, error_description=description)
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
     # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
@@ -175,7 +200,7 @@ async def try_again(request: Request, error: Exception) -> Response:
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
     app = create_server(settings, redis).streamable_http_app(transport_security=transport_security(settings), host=settings.host)
-    app.add_exception_handler(RedisError, try_again)  # LockError too
+    app.add_middleware(TryAgain)
     return BasicAuthClientId(app)
 
 

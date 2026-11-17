@@ -274,25 +274,111 @@ def fail(monkeypatch: pytest.MonkeyPatch, target: object, name: str) -> None:
     monkeypatch.setattr(target, name, down)
 
 
-# Every command, or only the transactions: a token write, or a grant's end.
-OUTAGES = {"everything": "execute_command", "transactions": None}
+def fail_command(monkeypatch: pytest.MonkeyPatch, redis: FakeAsyncRedis, step: int) -> list[str]:
+    """Fail the Redis command number `step`, from 0. Returns the failed command's name, once it fails.
+
+    Transactions aren't counted: a pipeline sends them on its own, without the client's execute_command.
+    """
+    original, sent, failed = redis.execute_command, [0], []
+
+    async def execute(*args, **kwargs):
+        sent[0] += 1
+        if sent[0] - 1 == step:
+            failed.append(args[0])
+            raise ConnectionError("Redis is down")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(redis, "execute_command", execute)
+    return failed
 
 
-def outage(monkeypatch: pytest.MonkeyPatch, redis: FakeAsyncRedis, which: str) -> None:
-    if OUTAGES[which]:
-        fail(monkeypatch, redis, OUTAGES[which])
-    fail(monkeypatch, Pipeline, "execute")
+# Sent once the new tokens or the grant's end are written: the lock's release, and the client registration's renewal.
+AFTER_THE_WRITE = ("EVALSHA", "SCRIPT LOAD", "EXPIRE")
 
 
-@pytest.mark.parametrize("which", OUTAGES)
 @respx.mock
-async def test_a_refresh_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch, caplog, which):
+async def test_a_refresh_with_any_redis_command_failing_can_be_retried(http, settings, redis, monkeypatch):
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+    store, step = Store(redis, settings.fernet_key), 0
+    while True:
+        client, grant_id = await register(http), f"grant-{step}"
+        tokens = (await exchange(http, client, await add_code(settings, redis, client, grant_id))).json()
+        with monkeypatch.context() as down:
+            failed = fail_command(down, redis, step)
+            response = await refresh(http, client, tokens["refresh_token"])
+        if not failed:
+            break
+        grant = await store.get("grant", grant_id, Grant)
+        if failed[0] in AFTER_THE_WRITE:
+            assert response.status_code == 200, (failed, response.text)
+            assert grant and grant.refresh_digest == digest(response.json()["refresh_token"])
+        else:
+            assert retryable(response), (failed, response.text)
+            assert grant and grant.refresh_digest == digest(tokens["refresh_token"]), failed
+            assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200, failed
+        step += 1
+    assert step >= 8
+
+
+async def test_a_code_exchange_with_any_redis_command_failing_can_be_retried_until_the_code_is_taken(
+    http, settings, redis, monkeypatch
+):
+    store, step, spent = Store(redis, settings.fernet_key), 0, []
+    while True:
+        client, grant_id = await register(http), f"grant-{step}"
+        code = await add_code(settings, redis, client, grant_id)
+        with monkeypatch.context() as down:
+            failed = fail_command(down, redis, step)
+            response = await exchange(http, client, code)
+        if not failed:
+            break
+        if failed[0] in AFTER_THE_WRITE:
+            assert response.status_code == 200, (failed, response.text)
+        else:
+            assert retryable(response), (failed, response.text)
+            # Taken by GETDEL before the tokens are written: a failure after it spends the code.
+            taken = await store.get("code", digest(code), Code) is None
+            retried = await exchange(http, client, code)
+            assert (retried.status_code, retried.json().get("error")) == ((400, "invalid_grant") if taken else (200, None))
+            spent += [failed[0]] if taken else []
+        step += 1
+    # The grant's read, just after GETDEL. Here a failed command never runs; on Redis, a GETDEL whose answer is lost has.
+    assert spent == ["GET"]
+
+
+@respx.mock
+async def test_a_revocation_with_any_redis_command_failing_can_be_retried(http, settings, redis, monkeypatch):
+    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    store, step = Store(redis, settings.fernet_key), 0
+    while True:
+        client, grant_id = await register(http), f"grant-{step}"
+        tokens = (await exchange(http, client, await add_code(settings, redis, client, grant_id))).json()
+        form = {"token": tokens["access_token"], **credentials(client)}
+        with monkeypatch.context() as down:
+            failed = fail_command(down, redis, step)
+            response = await http.post("/revoke", data=form)
+        if not failed:
+            break
+        if failed[0] in AFTER_THE_WRITE:
+            assert response.status_code == 200, (failed, response.text)
+        else:
+            assert (response.status_code, response.headers.get("retry-after")) == (503, "5"), (failed, response.text)
+            grant = await store.get("grant", grant_id, Grant)
+            assert grant and grant.access_digest == digest(tokens["access_token"]), failed
+            assert (await http.post("/revoke", data=form)).status_code == 200, failed
+        assert await store.get("grant", grant_id, Grant) is None
+        step += 1
+    assert step >= 6
+
+
+@respx.mock
+async def test_a_refresh_whose_token_write_fails_can_be_retried(http, settings, redis, monkeypatch, caplog):
     client = await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
     with monkeypatch.context() as down:
-        outage(down, redis, which)
+        fail(down, Pipeline, "execute")
         failed = await refresh(http, client, tokens["refresh_token"])
     assert retryable(failed), failed.text
     assert failed.headers["cache-control"] == "no-store"
@@ -302,21 +388,11 @@ async def test_a_refresh_during_a_redis_outage_can_be_retried(http, settings, re
     assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
 
 
-async def test_a_code_exchange_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch):
-    client = await register(http)
-    code = await add_code(settings, redis, client)
-    with monkeypatch.context() as down:
-        outage(down, redis, "everything")
-        failed = await exchange(http, client, code)
-    assert retryable(failed), failed.text
-    assert (await exchange(http, client, code)).status_code == 200
-
-
 async def test_a_code_whose_tokens_failed_to_save_is_spent(http, settings, redis, monkeypatch):
     client = await register(http)
     code = await add_code(settings, redis, client)
     with monkeypatch.context() as down:
-        outage(down, redis, "transactions")
+        fail(down, Pipeline, "execute")
         failed = await exchange(http, client, code)
     # Answered as any outage, but the code was taken before the write failed: the user signs in again.
     assert retryable(failed), failed.text
@@ -324,16 +400,15 @@ async def test_a_code_whose_tokens_failed_to_save_is_spent(http, settings, redis
     assert (spent.status_code, spent.json()["error"]) == (400, "invalid_grant")
 
 
-@pytest.mark.parametrize("which", OUTAGES)
 @respx.mock
-async def test_a_revocation_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch, which):
+async def test_a_revocation_whose_transaction_fails_keeps_the_grant(http, settings, redis, monkeypatch):
     client = await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
     lightdash = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
     form = {"token": tokens["access_token"], **credentials(client)}
 
     with monkeypatch.context() as down:
-        outage(down, redis, which)
+        fail(down, Pipeline, "execute")
         failed = await http.post("/revoke", data=form)
     assert failed.status_code == 503, failed.text
     assert failed.headers["retry-after"] == "5"
@@ -344,6 +419,19 @@ async def test_a_revocation_during_a_redis_outage_can_be_retried(http, settings,
 
     assert (await http.post("/revoke", data=form)).status_code == 200
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+
+
+async def test_a_bearer_header_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch):
+    # The SDK's Bearer middleware loads the token before the endpoint, outside the routes' error handling.
+    client = await register(http)
+    bearer = {"Authorization": "Bearer some-token"}
+    fail(monkeypatch, redis, "execute_command")
+    token = await http.post(
+        "/token", headers=bearer, data={"grant_type": "refresh_token", "refresh_token": "r", **credentials(client)}
+    )
+    assert retryable(token), token.text
+    revoked = await http.post("/revoke", headers=bearer, data={"token": "t", **credentials(client)})
+    assert revoked.status_code == 503, revoked.text
 
 
 @pytest.mark.parametrize("failing", [(Lock, "do_release"), (FakeAsyncRedis, "expire")], ids=["lock release", "client renewal"])
