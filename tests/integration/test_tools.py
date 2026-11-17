@@ -1,6 +1,7 @@
 """Every tool against the local Lightdash, as the admin and as the viewer."""
 
 import logging
+import secrets
 from typing import Any
 
 import httpx
@@ -287,6 +288,57 @@ async def test_saved_content_tools(viewer, tool, project_uuid, filtered_dashboar
     assert "not on the dashboard" in denied(
         await tool(viewer, "run_chart", {**args, "chart_uuid": other, "dashboard_uuid": dashboard_uuid})
     )
+
+
+async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uuid, lightdash_admin):
+    args = {"project_uuid": project_uuid}
+    found = ok(await tool(admin, "search_content", {**args, "search": "per payment method", "content_type": "chart"}))
+    source = next(c for c in found if c["name"] == "How much revenue do we have per payment method?")
+    suffix = secrets.token_hex(3)
+    chart = ok(await tool(admin, "get_chart_code", {**args, "slug": source["slug"]})) | {
+        "name": f"mcp test chart {suffix}",
+        "slug": f"mcp-test-chart-{suffix}",
+    }
+    tile = {"type": "saved_chart", "x": 0, "y": 0, "w": 12, "h": 9, "properties": {"chartSlug": chart["slug"]}}
+    dashboard = {
+        "name": f"mcp test dashboard {suffix}",
+        "slug": f"mcp-test-dashboard-{suffix}",
+        "spaceSlug": chart["spaceSlug"],
+        "tiles": [tile],
+    }
+    saved: dict[str, str] = {}
+    try:
+        previewed = ok(await tool(admin, "save_dashboard", {**args, "dashboard": dashboard}))
+        assert previewed["chartsNotSavedYet"] == [chart["slug"]]
+        assert "No chart with slug" in denied(
+            await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False})
+        )
+
+        assert ok(await tool(admin, "save_chart", {**args, "chart": chart}))["wouldCreate"]["slug"] == chart["slug"]
+        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+        created = ok(await tool(admin, "save_chart", {**args, "chart": chart, "dry_run": False}))
+        saved["chart"] = created["uuid"]
+        assert created["action"] == "create" and created["url"].endswith(f"/saved/{created['uuid']}")
+        assert created["validationErrors"] == []
+        assert ok(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))["name"] == chart["name"]
+
+        created = ok(await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False}))
+        saved["dashboard"] = created["uuid"]
+        assert created["action"] == "create" and created["url"].endswith(f"/dashboards/{created['uuid']}")
+        code = ok(await tool(admin, "get_dashboard_code", {**args, "slug": dashboard["slug"]}))
+        assert [t["properties"]["chartSlug"] for t in code["tiles"]] == [chart["slug"]]
+
+        for content_type in ("dashboard", "chart"):
+            delete = {**args, "content_type": content_type, "uuid": saved[content_type]}
+            assert ok(await tool(admin, "delete_content", delete))["wouldDelete"]
+            ok(await tool(admin, "delete_content", {**delete, "dry_run": False}))
+            del saved[content_type]
+        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+    finally:
+        if "dashboard" in saved:
+            lightdash_admin.delete(f"/api/v1/dashboards/{saved['dashboard']}")
+        if "chart" in saved:
+            lightdash_admin.delete(f"/api/v1/saved/{saved['chart']}")
 
 
 async def test_tool_calls_are_logged(admin, tool, project_uuid, caplog):
