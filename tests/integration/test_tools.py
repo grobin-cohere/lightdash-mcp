@@ -2,6 +2,7 @@
 
 import json
 import logging
+import secrets
 from typing import Any
 
 import httpx
@@ -288,6 +289,65 @@ async def test_saved_content_tools(viewer, tool, project_uuid, filtered_dashboar
     assert "not on the dashboard" in denied(
         await tool(viewer, "run_chart", {**args, "chart_uuid": other, "dashboard_uuid": dashboard_uuid})
     )
+
+
+async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uuid, lightdash_admin):
+    args = {"project_uuid": project_uuid}
+    found = ok(await tool(admin, "search_content", {**args, "search": "per payment method", "content_type": "chart"}))
+    source = next((c for c in found if c["name"] == "How much revenue do we have per payment method?"), None)
+    assert source, found
+    suffix = secrets.token_hex(3)
+    downloaded = ok(await tool(admin, "get_chart_code", {**args, "slug": source["slug"]}))
+    # A copy in the same space: not on the source's dashboard, nor with its access.
+    copied = {k: v for k, v in downloaded.items() if k not in ("dashboardSlug", "access", "updatedAt", "downloadedAt")}
+    chart = copied | {"name": f"mcp test chart {suffix}", "slug": f"mcp-test-chart-{suffix}"}
+    tile = {"type": "saved_chart", "x": 0, "y": 0, "w": 12, "h": 9, "properties": {"chartSlug": chart["slug"]}}
+    dashboard = {
+        "name": f"mcp test dashboard {suffix}",
+        "slug": f"mcp-test-dashboard-{suffix}",
+        "spaceSlug": chart["spaceSlug"],
+        "tiles": [tile],
+    }
+    saved: dict[str, str] = {}
+
+    def leftovers() -> list[dict[str, Any]]:
+        """What this test made, found by name: a save can succeed even when its tool call then fails."""
+        content = lightdash_admin.get(
+            "/api/v2/content", params={"projectUuids": project_uuid, "search": "mcp test", "pageSize": 100}
+        ).json()["results"]["data"]
+        return [c for c in content if c["name"].endswith(suffix)]
+
+    try:
+        previewed = ok(await tool(admin, "save_dashboard", {**args, "dashboard": dashboard}))
+        assert previewed["chartsNotSavedYet"] == [chart["slug"]]
+        assert "No chart with slug" in denied(
+            await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False})
+        )
+
+        assert ok(await tool(admin, "save_chart", {**args, "chart": chart}))["wouldCreate"]["slug"] == chart["slug"]
+        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+        created = ok(await tool(admin, "save_chart", {**args, "chart": chart, "dry_run": False}))
+        saved["chart"] = created["uuid"]
+        assert created["action"] == "create" and created["url"].endswith(f"/saved/{created['uuid']}")
+        assert created.get("validationErrors") == [], created
+        assert ok(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))["name"] == chart["name"]
+
+        created = ok(await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False}))
+        saved["dashboard"] = created["uuid"]
+        assert created["action"] == "create" and created["url"].endswith(f"/dashboards/{created['uuid']}")
+        code = ok(await tool(admin, "get_dashboard_code", {**args, "slug": dashboard["slug"]}))
+        assert [t["properties"]["chartSlug"] for t in code["tiles"]] == [chart["slug"]]
+
+        for content_type in ("dashboard", "chart"):
+            delete = {**args, "content_type": content_type, "uuid": saved[content_type]}
+            assert ok(await tool(admin, "delete_content", delete))["wouldDelete"]
+            ok(await tool(admin, "delete_content", {**delete, "dry_run": False}))
+        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+        assert leftovers() == []
+    finally:
+        for item in sorted(leftovers(), key=lambda c: c["contentType"] != "dashboard"):
+            path = "dashboards" if item["contentType"] == "dashboard" else "saved"
+            lightdash_admin.delete(f"/api/v1/{path}/{item['uuid']}")
 
 
 async def test_tool_calls_are_logged(admin, tool, project_uuid, lightdash_admin, caplog):
