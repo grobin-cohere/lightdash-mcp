@@ -1,5 +1,6 @@
 """Every tool against the local Lightdash, as the admin and as the viewer."""
 
+import json
 import logging
 from typing import Any
 
@@ -293,7 +294,8 @@ async def test_tool_calls_are_logged(admin, tool, project_uuid, caplog):
     caplog.set_level(logging.INFO, logger="lightdash_mcp.audit")
     ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
     denied(await tool(admin, "list_spaces", {"project_uuid": "00000000-0000-4000-8000-000000000000"}))
-    lines = [r.getMessage() for r in caplog.records if r.name == "lightdash_mcp.audit"]
-    assert len(lines) == 2 and all("tool=list_spaces" in line and "user=None" not in line for line in lines)
-    assert f'"project_uuid": "{project_uuid}"' in lines[0] and lines[0].endswith("error=False")
-    assert lines[1].endswith("error=True")
+    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
+    entries = [line for line in lines if line["event"] == "tool_call"]
+    assert len(entries) == 2 and all(e["tool"] == "list_spaces" and e["user"] is not None for e in entries)
+    assert entries[0]["arguments"]["project_uuid"] == project_uuid and entries[0]["error"] is False
+    assert entries[1]["error"] is True
