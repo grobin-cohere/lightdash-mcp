@@ -948,7 +948,7 @@ def no_waiting(monkeypatch):
     async def skip(seconds: float) -> None:
         await real_sleep(0)
 
-    monkeypatch.setattr(content, "VALIDATION_TIMEOUT", 3)
+    monkeypatch.setattr(content, "MAX_VALIDATION_POLLS", 3)
     monkeypatch.setattr(asyncio, "sleep", skip)
 
 
