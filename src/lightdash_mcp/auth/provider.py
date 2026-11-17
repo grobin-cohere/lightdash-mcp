@@ -425,7 +425,7 @@ class LightdashOAuthProvider:
         try:
             await self.end_grant(token.grant_id, "revoked", revoke_upstream=True, revoked=token)
         except LockNotOwnedError:
-            raise  # the lock expired before its release: the revocation is done, and logged
+            raise  # the lock expired before its release: the grant is ended and logged, Lightdash's token isn't revoked
         except LockError:
             record("revoke_busy", logging.WARNING, grant=token.grant_id, subject=token.subject, client_id=token.client_id)
             raise
@@ -535,8 +535,8 @@ class LightdashOAuthProvider:
     async def _end_grant(self, grant_id: str, reason: str, revoked: Access | Refresh | None = None) -> Grant | None:
         """Ends the grant and its tokens, and logs the `revoked` token that ends it. The caller holds the grant's lock."""
         grant = await self.store.pop("grant", grant_id, Grant)
-        if revoked:
-            # Logged once its grant is gone: from then on, the token no longer loads.
+        if revoked and grant:
+            # Logged once its grant is gone, from then on the token no longer loads, and only by the request that ended it.
             record("token_revoked", grant=grant_id, subject=revoked.subject, client_id=revoked.client_id)
         if grant:
             await self.store.write(delete=[("access", grant.access_digest), ("refresh", grant.refresh_digest)])
