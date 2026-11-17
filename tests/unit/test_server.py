@@ -1,5 +1,6 @@
 """The server over HTTP: the SDK's token and revocation endpoints with this provider, body limits, the audit log."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -13,6 +14,7 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 
 from lightdash_mcp import server as server_module
+from lightdash_mcp.auth import store as store_module
 from lightdash_mcp.auth.audit import MAX_VALUE
 from lightdash_mcp.auth.provider import Code, Grant, _challenge
 from lightdash_mcp.auth.store import Store, digest
@@ -20,6 +22,8 @@ from lightdash_mcp.config import Settings
 from lightdash_mcp.server import asgi_app, audit, create_server
 
 LIGHTDASH = "http://lightdash.test"
+TOKEN_URL = f"{LIGHTDASH}/api/v1/oauth/token"
+REVOKE_URL = f"{LIGHTDASH}/api/v1/oauth/revoke"
 REDIRECT = "http://localhost:9999/callback"
 VERIFIER = "v" * 64
 REFRESHED = httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
@@ -142,6 +146,122 @@ async def test_a_basic_auth_client_can_revoke(http, settings, redis):
         revoked = await http.post("/revoke", headers=basic, data={"token": tokens.json()["access_token"]})
     assert revoked.status_code == 200, revoked.text
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+
+
+@pytest.fixture
+def busy(redis, monkeypatch):
+    """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up after 0.1 seconds."""
+    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
+    return redis.lock("lightdash-mcp:lock:grant:grant", timeout=60)
+
+
+def retryable(response: httpx.Response) -> bool:
+    """An OAuth error that tells the client to try again with the same code or refresh token, which still work."""
+    body = response.json()
+    return response.status_code == 400 and body["error"] == "invalid_request" and "Try again" in body["error_description"]
+
+
+@pytest.mark.parametrize(
+    "lightdash",
+    [
+        httpx.ConnectError("down"),
+        httpx.ReadTimeout("slow"),
+        httpx.Response(502),
+        httpx.Response(401, json={"error": "invalid_client"}),
+        httpx.Response(200, json={"access_token": "only"}),
+    ],
+)
+@respx.mock
+async def test_a_refresh_lightdash_fails_can_be_retried(http, settings, redis, lightdash):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    route = respx.post(TOKEN_URL).mock(side_effect=[lightdash])
+
+    failed = await refresh(http, client, tokens["refresh_token"])
+    assert retryable(failed), failed.text
+    assert failed.headers["cache-control"] == "no-store"
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+
+    route.mock(side_effect=None, return_value=REFRESHED)
+    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+
+
+@respx.mock
+async def test_a_refresh_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    route = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    async with busy:
+        failed = await refresh(http, client, tokens["refresh_token"])
+    assert retryable(failed), failed.text
+    assert not route.called
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+
+
+async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+    client = await register(http)
+    code = await add_code(settings, redis, client)
+    async with busy:
+        failed = await exchange(http, client, code)
+    assert retryable(failed), failed.text
+    assert (await exchange(http, client, code)).status_code == 200
+
+
+@respx.mock
+async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(http, settings, redis, busy):
+    client = await register(http)
+    first = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    assert (await refresh(http, client, first["refresh_token"])).status_code == 200
+
+    # Reuse is found while the token loads, outside the SDK's error handling: the grant can't end with its lock busy.
+    async with busy:
+        failed = await refresh(http, client, first["refresh_token"])
+    assert retryable(failed), failed.text
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+
+    reused = await refresh(http, client, first["refresh_token"])
+    assert (reused.status_code, reused.json()["error"]) == (400, "invalid_grant")
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+
+
+@respx.mock
+async def test_a_revocation_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    form = {"token": tokens["access_token"], **credentials(client)}
+
+    async with busy:
+        failed = await http.post("/revoke", data=form)
+    # RFC 7009 section 2.2.1: the client must assume the token still works, and may retry.
+    assert failed.status_code == 503, failed.text
+    assert failed.headers["retry-after"]
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+
+    assert (await http.post("/revoke", data=form)).status_code == 200
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+
+
+@respx.mock
+async def test_a_refresh_that_outlasts_the_lock_still_returns_its_tokens(http, settings, redis, monkeypatch):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.05)
+
+    async def slow(request):
+        await asyncio.sleep(0.2)
+        return REFRESHED
+
+    respx.post(TOKEN_URL).mock(side_effect=slow)
+    # The new tokens are saved and the old refresh token rotated: an error here would leave the client with neither.
+    refreshed = await refresh(http, client, tokens["refresh_token"])
+    assert refreshed.status_code == 200, refreshed.text
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+    assert (await refresh(http, client, refreshed.json()["refresh_token"])).status_code == 200
 
 
 async def test_large_token_bodies_are_refused_before_they_are_read(http):

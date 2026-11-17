@@ -9,7 +9,7 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from mcp.server.auth.provider import AuthorizationParams
+from mcp.server.auth.provider import AuthorizationParams, TokenError
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
@@ -288,8 +288,10 @@ async def test_refresh_token_survives_lightdash_being_down(provider):
     await add_grant(provider, 3600)
     refresh = await refresh_of(provider)
     respx.post(TOKEN_URL).mock(side_effect=httpx.ConnectError("down"))
-    with pytest.raises(RefreshFailed):
+    with pytest.raises(TokenError) as error:
         await provider.exchange_refresh_token(CLIENT, refresh, [])
+    assert error.value.error == "invalid_request"
+    assert error.value.error_description == "Couldn't reach Lightdash to refresh your sign-in. Try again in a moment."
     assert await refresh_of(provider) == refresh
 
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
