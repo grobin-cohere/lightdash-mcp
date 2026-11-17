@@ -8,12 +8,14 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from redis.exceptions import LockError
 
-from lightdash_mcp.auth.provider import Access, LightdashOAuthProvider, SignInRequired
+from lightdash_mcp.auth.provider import Access, LightdashOAuthProvider, RefreshFailed, SignInRequired
 from lightdash_mcp.lightdash import LightdashClient, LightdashError
 
 RECONNECT = "Your Lightdash sign-in has ended. Reconnect this MCP server to sign in again."
 UNREACHABLE = "Couldn't reach Lightdash. Try again in a moment."
+BUSY = "Another request is refreshing your Lightdash sign-in. Try again in a moment."
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -21,16 +23,17 @@ CREATE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempoten
 DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False)
 
 # Arguments that go into Lightdash URL paths: a `../` or `?` in one would reach another endpoint.
-Uuid = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")]
+UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+SLUG = r"[a-z0-9][a-z0-9-]*"
+Uuid = Annotated[str, Field(pattern=f"^{UUID}$")]
 Name = Annotated[str, Field(pattern=r"^[\w-]+$")]
-# A chart's UUID or its slug: lowercase letters, digits and hyphens, so it is safe in a path too.
-ChartRef = Annotated[str, Field(pattern=r"^[0-9a-z][0-9a-z-]*$|^[0-9a-fA-F-]{36}$")]
-UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+Slug = Annotated[str, Field(pattern=f"^{SLUG}$")]
+ChartRef = Annotated[str, Field(pattern=f"^{SLUG}$|^{UUID}$")]
 
 
 async def resolve_chart(ld: LightdashClient, project_uuid: str, chart: str) -> str:
     """The UUID of a chart of the project, given by UUID or by slug."""
-    if UUID_PATTERN.match(chart):
+    if re.fullmatch(UUID, chart):
         return chart
     found = await ld.get(f"/api/v1/saved/{chart}")
     if found.get("projectUuid") != project_uuid:
@@ -44,26 +47,23 @@ async def lightdash(provider: LightdashOAuthProvider) -> AsyncIterator[Lightdash
     token = get_access_token()
     if not isinstance(token, Access):
         raise ToolError("Not signed in.")
+
+    def refresh(refused: str) -> Awaitable[str]:
+        return provider.lightdash_token(token.grant_id, refused)
+
+    # One mapping for the first token, the refresh after a 401, and the tool's own calls.
     try:
-        access_token = await provider.lightdash_token(token.grant_id)
+        yield LightdashClient(provider.http, await provider.lightdash_token(token.grant_id), refresh)
     except SignInRequired:
         raise ToolError(RECONNECT) from None
-    except httpx.HTTPStatusError as error:
-        raise ToolError(f"Lightdash error {error.response.status_code} while refreshing your sign-in. Try again later.") from None
-    except httpx.HTTPError:
-        raise ToolError(UNREACHABLE) from None
-
-    def refresh() -> Awaitable[str]:
-        return provider.lightdash_token(token.grant_id, force_refresh=True)
-
-    try:
-        yield LightdashClient(provider.http, access_token, refresh)
-    except SignInRequired:
-        raise ToolError(RECONNECT) from None
+    except RefreshFailed as error:
+        raise ToolError(str(error)) from None
+    except LockError:
+        raise ToolError(BUSY) from None
     except LightdashError as error:
         if error.status == 401:
-            await provider.end_grant(token.grant_id)
-            raise ToolError(RECONNECT) from None
+            # Refused again with a freshly refreshed token: not about the sign-in, which Lightdash just renewed.
+            raise ToolError(f"Lightdash refused this request (401): {error.message}") from None
         if error.status == 403:
             raise ToolError(f"Permission denied: your Lightdash role doesn't allow this. {error.message}") from None
         if error.status == 404:

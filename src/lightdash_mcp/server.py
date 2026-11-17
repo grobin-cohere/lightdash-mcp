@@ -1,11 +1,9 @@
 import base64
 import binascii
-import json
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import uvicorn
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -16,17 +14,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from lightdash_mcp.auth.provider import SCOPE, LightdashOAuthProvider
+from lightdash_mcp.auth.audit import clip, clip_arguments, record
+from lightdash_mcp.auth.provider import FORM_LIMIT, SCOPE, LightdashOAuthProvider, read_body
 from lightdash_mcp.auth.store import Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
-
-logger = logging.getLogger("lightdash_mcp.audit")
+REDIS_TIMEOUT = 5  # seconds: a Redis that stops answering fails a request instead of hanging it
 
 
 async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
@@ -41,23 +39,29 @@ async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> Han
         return result
     finally:
         token = get_access_token()
-        logger.info(
-            "user=%s tool=%s arguments=%s error=%s",
-            token.subject if token else None,
-            ctx.params.get("name"),
-            json.dumps(ctx.params.get("arguments") or {}, default=str),
-            failed,
+        record(
+            "tool_call",
+            user=token.subject if token else None,
+            tool=clip(ctx.params.get("name")),
+            arguments=clip_arguments(ctx.params.get("arguments") or {}),
+            error=failed,
         )
 
 
 def create_server(settings: Settings, redis: Redis | None = None) -> MCPServer:
-    store = Store(redis or Redis.from_url(settings.redis_url), settings.fernet_key)
+    redis = redis or Redis.from_url(settings.redis_url, socket_timeout=REDIS_TIMEOUT, socket_connect_timeout=REDIS_TIMEOUT)
+    store = Store(redis, settings.fernet_key)
     provider = LightdashOAuthProvider(settings, store)
 
     @asynccontextmanager
     async def lifespan(_: MCPServer) -> AsyncIterator[None]:
-        yield
-        await provider.http.aclose()
+        try:
+            yield
+        finally:
+            try:
+                await provider.http.aclose()
+            finally:
+                await store.close()
 
     server = MCPServer(
         name="lightdash-mcp",
@@ -94,31 +98,32 @@ def create_server(settings: Settings, redis: Redis | None = None) -> MCPServer:
 
 
 class BasicAuthClientId:
-    """Copy the client ID of a Basic `Authorization` header into a /token request body that has none.
+    """Copy the client ID and secret of a Basic `Authorization` header into a /token or /revoke form that lacks them.
 
-    RFC 6749 section 2.3.1 lets a `client_secret_basic` client send its ID only in the header, as Dex does
-    for North. The MCP SDK's token endpoint also requires `client_id` in the form, and refuses those
-    requests without it. The secret is still checked by the SDK, from the header.
+    RFC 6749 section 2.3.1 lets a `client_secret_basic` client send its credentials only in the header, as Dex
+    does for North. The MCP SDK's token endpoint also requires `client_id` in the form, and its revocation
+    endpoint `client_id` and `client_secret`, and they refuse those requests without them. The SDK still checks
+    the secret, from the header for a `client_secret_basic` client.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/token":
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in ("/token", "/revoke"):
             return await self.app(scope, receive, send)
         headers = dict(scope["headers"])
-        client_id = _basic_client_id(headers.get(b"authorization", b"").decode("latin-1"))
-        if not client_id:
+        credentials = _basic_credentials(headers.get(b"authorization", b"").decode("latin-1"))
+        if not credentials:
             return await self.app(scope, receive, send)
-        body = b""
-        while True:
-            message = await receive()
-            body += message.get("body", b"")
-            if not message.get("more_body"):
-                break
-        if "client_id" not in parse_qs(body.decode("utf-8", "replace")):
-            body += (b"&" if body else b"") + f"client_id={quote(client_id, safe='')}".encode()
+        # Read before the SDK's own body limit applies, so limited here too.
+        body = await read_body(Request(scope, receive), FORM_LIMIT)
+        if body is None:
+            return await Response("Request body too large", status_code=413)(scope, receive, send)
+        form = parse_qs(body.decode("utf-8", "replace"))
+        missing = {name: value for name, value in zip(("client_id", "client_secret"), credentials) if name not in form}
+        if missing:
+            body += (b"&" if body else b"") + urlencode(missing).encode()
             headers[b"content-length"] = str(len(body)).encode()
             scope = {**scope, "headers": list(headers.items())}
         sent = False
@@ -133,15 +138,15 @@ class BasicAuthClientId:
         await self.app(scope, replay, send)
 
 
-def _basic_client_id(authorization: str) -> str | None:
+def _basic_credentials(authorization: str) -> tuple[str, str] | None:
     if not authorization.startswith("Basic "):
         return None
     try:
         decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
     except binascii.Error, UnicodeDecodeError:
         return None
-    client_id, separator, _ = decoded.partition(":")
-    return unquote(client_id) if separator and client_id else None
+    client_id, separator, secret = decoded.partition(":")
+    return (unquote(client_id), unquote(secret)) if separator and client_id else None
 
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
