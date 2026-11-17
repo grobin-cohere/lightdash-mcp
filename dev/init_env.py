@@ -1,4 +1,5 @@
-"""Creates .env for the local Lightdash (make dev): registers an OAuth client with it and generates FERNET_KEY."""
+"""Creates .env for the local Lightdash (make dev): registers an OAuth client with it and generates
+FERNET_KEY."""
 
 from pathlib import Path
 
@@ -28,8 +29,10 @@ values = {
 }
 
 lines = [MARKER]
+
 for line in Path(".env.example").read_text().splitlines():
     key = line.partition("=")[0]
     lines.append(f"{key}={values[key]}" if key in values else line)
+
 Path(".env").write_text("\n".join(lines) + "\n")
 print("Created .env")

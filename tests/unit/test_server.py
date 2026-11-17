@@ -1,7 +1,9 @@
-"""The server over HTTP: the SDK's token and revocation endpoints with this provider, body limits, the audit log."""
+"""The server over HTTP: the SDK's token and revocation endpoints with this provider, body limits,
+the audit log."""
 
 import asyncio
 import base64
+import itertools
 import json
 import logging
 import time
@@ -21,7 +23,7 @@ from redis.exceptions import ConnectionError
 from lightdash_mcp import server as server_module
 from lightdash_mcp.auth import store as store_module
 from lightdash_mcp.auth.audit import MAX_ITEMS, MAX_VALUE, clip_arguments
-from lightdash_mcp.auth.provider import CLIENT_TTL, Access, Code, Grant, _challenge
+from lightdash_mcp.auth.provider import CLIENT_TTL, Access, Code, Grant
 from lightdash_mcp.auth.store import Store, digest
 from lightdash_mcp.config import Settings
 from lightdash_mcp.server import (
@@ -33,9 +35,27 @@ from lightdash_mcp.server import (
     transport_security,
 )
 
-from .conftest import REDIRECT, REFRESHED, REVOKE_URL, TOKEN_URL, make_settings
+from .conftest import (
+    REDIRECT,
+    REFRESHED,
+    REVOKE_URL,
+    TOKEN_LIFETIME,
+    TOKEN_URL,
+    VERIFIER,
+    add_code,
+    make_settings,
+)
 
-VERIFIER = "v" * 64
+INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "1"},
+    },
+}
 
 
 @pytest.fixture
@@ -46,123 +66,198 @@ def settings() -> Settings:
 
 @pytest.fixture
 async def http(settings, redis):
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(asgi_app(settings, redis)), base_url="http://localhost:8000"
-    ) as http:
+    transport = httpx.ASGITransport(asgi_app(settings, redis))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as http:
         yield http
 
 
 async def register(http: httpx.AsyncClient, auth_method: str = "client_secret_post") -> dict:
-    response = await http.post(
-        "/register", json={"client_name": "App", "redirect_uris": [REDIRECT], "token_endpoint_auth_method": auth_method}
-    )
+    metadata = {
+        "client_name": "App",
+        "redirect_uris": [REDIRECT],
+        "token_endpoint_auth_method": auth_method,
+    }
+
+    response = await http.post("/register", json=metadata)
+
     assert response.status_code == 201, response.text
     return response.json()
 
 
-async def add_code(settings: Settings, redis: FakeAsyncRedis, client: dict, grant_id: str = "grant") -> str:
-    """A finished sign-in, as the Lightdash callback leaves it. Returns the client's code."""
-    store, code = Store(redis, settings.fernet_key), f"code-{grant_id}"
-    grant = Grant(
-        client_id=client["client_id"],
-        subject="user",
-        access_token="ld-access",
-        refresh_token="ld-refresh",
-        expires_at=time.time() + 3600,
-        code_digest=digest(code),
-    )
-    await store.put("grant", grant_id, grant, 600)
-    await store.put(
-        "code",
-        digest(code),
-        Code(
-            code=code,
-            scopes=["lightdash"],
-            expires_at=time.time() + 300,
-            client_id=client["client_id"],
-            code_challenge=_challenge(VERIFIER),
-            redirect_uri=REDIRECT,
-            redirect_uri_provided_explicitly=True,
-            subject="user",
-            grant_id=grant_id,
-        ),
-        300,
-    )
-    return code
+def basic(credentials: bytes) -> str:
+    return "Basic " + base64.b64encode(credentials).decode()
+
+
+def basic_for(client: dict) -> str:
+    credentials = f"{client['client_id']}:{client['client_secret']}"
+
+    return basic(credentials.encode())
 
 
 def credentials(client: dict) -> dict:
     return {"client_id": client["client_id"], "client_secret": client["client_secret"]}
 
 
-async def exchange(http: httpx.AsyncClient, client: dict, code: str, verifier: str = VERIFIER) -> httpx.Response:
-    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT, "code_verifier": verifier}
-    return await http.post("/token", data={**form, **credentials(client)})
+def code_form(code: str, verifier: str = VERIFIER) -> dict:
+    return {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT,
+        "code_verifier": verifier,
+    }
+
+
+async def exchange(
+    http: httpx.AsyncClient,
+    client: dict,
+    code: str,
+    verifier: str = VERIFIER,
+) -> httpx.Response:
+    form = code_form(code, verifier) | credentials(client)
+
+    return await http.post("/token", data=form)
 
 
 async def refresh(http: httpx.AsyncClient, client: dict, refresh_token: str) -> httpx.Response:
-    return await http.post("/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token, **credentials(client)})
+    form = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        **credentials(client),
+    }
+
+    return await http.post("/token", data=form)
+
+
+def audit_messages(caplog) -> list[str]:
+    records = [record for record in caplog.records if record.name == "lightdash_mcp.audit"]
+
+    return [record.getMessage() for record in records]
+
+
+def audit_lines(caplog) -> list[dict]:
+    return [json.loads(message) for message in audit_messages(caplog)]
+
+
+def tool_call() -> SimpleNamespace:
+    return SimpleNamespace(method="tools/call", params={"name": "list_projects", "arguments": {}})
 
 
 async def test_a_code_needs_its_verifier_and_works_once(http, settings, redis):
     client = await register(http)
     code = await add_code(settings, redis, client)
+
     wrong = await exchange(http, client, code, "w" * 64)
-    assert (wrong.status_code, wrong.json()["error"]) == (400, "invalid_grant")
-    assert (await exchange(http, client, code)).status_code == 200
+    right = await exchange(http, client, code)
     reused = await exchange(http, client, code)
-    assert (reused.status_code, reused.json()["error"]) == (400, "invalid_grant")
+
+    assert wrong.status_code == 400
+    assert wrong.json()["error"] == "invalid_grant"
+    assert right.status_code == 200
+    assert reused.status_code == 400
+    assert reused.json()["error"] == "invalid_grant"
 
 
 async def test_a_code_works_for_its_own_client_only(http, settings, redis):
-    client, other = await register(http), await register(http)
+    client = await register(http)
+    other = await register(http)
     code = await add_code(settings, redis, client)
-    assert (await exchange(http, other, code)).status_code == 400
-    assert (await exchange(http, client, code)).status_code == 200
+
+    stolen = await exchange(http, other, code)
+    exchanged = await exchange(http, client, code)
+
+    assert stolen.status_code == 400
+    assert exchanged.status_code == 200
 
 
 @respx.mock
 async def test_a_refresh_token_works_for_its_own_client_only(http, settings, redis):
-    client, other = await register(http), await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    client = await register(http)
+    other = await register(http)
+    code = await add_code(settings, redis, client)
+    exchanged = await exchange(http, client, code)
+    refresh_token = exchanged.json()["refresh_token"]
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
-    stolen = await refresh(http, other, tokens["refresh_token"])
-    assert (stolen.status_code, stolen.json()["error"]) == (400, "invalid_grant")
-    rotated = await refresh(http, client, tokens["refresh_token"])
+    stolen = await refresh(http, other, refresh_token)
+    rotated = await refresh(http, client, refresh_token)
+
+    assert stolen.status_code == 400
+    assert stolen.json()["error"] == "invalid_grant"
     assert rotated.status_code == 200, rotated.text
 
 
 async def test_a_basic_auth_client_can_revoke(http, settings, redis):
     client = await register(http, "client_secret_basic")
-    basic = {"Authorization": "Basic " + base64.b64encode(f"{client['client_id']}:{client['client_secret']}".encode()).decode()}
-    form = {"grant_type": "authorization_code", "code": await add_code(settings, redis, client)}
-    tokens = await http.post("/token", headers=basic, data={**form, "redirect_uri": REDIRECT, "code_verifier": VERIFIER})
+    headers = {"Authorization": basic_for(client)}
+    code = await add_code(settings, redis, client)
+
+    tokens = await http.post("/token", headers=headers, data=code_form(code))
+
     assert tokens.status_code == 200, tokens.text
+
+    revocation = {"token": tokens.json()["access_token"]}
 
     with respx.mock:
         respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-        revoked = await http.post("/revoke", headers=basic, data={"token": tokens.json()["access_token"]})
+        revoked = await http.post("/revoke", headers=headers, data=revocation)
+
+    store = Store(redis, settings.fernet_key)
+    grant = await store.get("grant", "grant", Grant)
     assert revoked.status_code == 200, revoked.text
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+    assert grant is None
 
 
 @pytest.fixture
 def held_lock(redis, monkeypatch):
-    """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up after 0.1 seconds."""
+    """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up
+    after 0.1 seconds."""
     monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
+
     return redis.lock("lightdash-mcp:lock:grant:grant", timeout=60)
 
 
+async def sign_in(
+    http: httpx.AsyncClient,
+    settings: Settings,
+    redis: FakeAsyncRedis,
+    grant_id: str = "grant",
+) -> tuple[dict, dict]:
+    """A registered client, and the tokens its finished sign-in got."""
+    client = await register(http)
+    code = await add_code(settings, redis, client, grant_id)
+    exchanged = await exchange(http, client, code)
+
+    return client, exchanged.json()
+
+
+async def stored_grant(
+    settings: Settings,
+    redis: FakeAsyncRedis,
+    grant_id: str = "grant",
+) -> Grant | None:
+    store = Store(redis, settings.fernet_key)
+
+    return await store.get("grant", grant_id, Grant)
+
+
+def revocation_form(client: dict, token: str) -> dict:
+    return {"token": token, **credentials(client)}
+
+
 def retryable(response: httpx.Response) -> bool:
-    """An OAuth error that tells the client to try again with the same code or refresh token, which still work."""
+    """An OAuth error that tells the client to try again with the same code or refresh token,
+    which still work."""
     body = response.json()
-    retry = body["error"] == "invalid_request" and "Try again" in body["error_description"]
-    return response.status_code == 400 and retry and response.headers["cache-control"] == "no-store"
+    is_a_retry_error = body["error"] == "invalid_request"
+    asks_to_try_again = is_a_retry_error and "Try again" in body["error_description"]
+    is_not_cached = response.headers["cache-control"] == "no-store"
+
+    return response.status_code == 400 and asks_to_try_again and is_not_cached
 
 
 @pytest.mark.parametrize(
-    "lightdash",
+    "answer",
     [
         httpx.ConnectError("down"),
         httpx.ReadTimeout("slow"),
@@ -172,316 +267,490 @@ def retryable(response: httpx.Response) -> bool:
     ],
 )
 @respx.mock
-async def test_a_refresh_lightdash_fails_can_be_retried(http, settings, redis, lightdash):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
-    route = respx.post(TOKEN_URL).mock(side_effect=[lightdash])
+async def test_a_refresh_lightdash_fails_can_be_retried(http, settings, redis, answer):
+    client, tokens = await sign_in(http, settings, redis)
+    route = respx.post(TOKEN_URL).mock(side_effect=[answer])
 
     failed = await refresh(http, client, tokens["refresh_token"])
+
+    grant = await stored_grant(settings, redis)
     assert retryable(failed), failed.text
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant
 
     route.mock(side_effect=None, return_value=REFRESHED)
-    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+
+    retried = await refresh(http, client, tokens["refresh_token"])
+
+    assert retried.status_code == 200
 
 
 @respx.mock
 async def test_a_refresh_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    client, tokens = await sign_in(http, settings, redis)
     route = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
     async with held_lock:
         failed = await refresh(http, client, tokens["refresh_token"])
+
+    grant = await stored_grant(settings, redis)
     assert retryable(failed), failed.text
     assert not route.called
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+    assert grant
+
+    retried = await refresh(http, client, tokens["refresh_token"])
+
+    assert retried.status_code == 200
 
 
-async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
+async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(
+    http, settings, redis, held_lock
+):
     client = await register(http)
     code = await add_code(settings, redis, client)
+
     async with held_lock:
         failed = await exchange(http, client, code)
+
     assert retryable(failed), failed.text
-    assert (await exchange(http, client, code)).status_code == 200
+
+    retried = await exchange(http, client, code)
+
+    assert retried.status_code == 200
 
 
 @respx.mock
-async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(http, settings, redis, held_lock):
-    client = await register(http)
-    first = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(
+    http, settings, redis, held_lock
+):
+    client, tokens = await sign_in(http, settings, redis)
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
     revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    assert (await refresh(http, client, first["refresh_token"])).status_code == 200
 
-    # Reuse is found while the token loads, outside the SDK's error handling: the grant can't end with its lock busy.
+    rotated = await refresh(http, client, tokens["refresh_token"])
+
+    assert rotated.status_code == 200
+
+    # Reuse is found while the token loads, outside the SDK's error handling: the grant can't end
+    # with its lock busy.
     async with held_lock:
-        failed = await refresh(http, client, first["refresh_token"])
+        failed = await refresh(http, client, tokens["refresh_token"])
+
+    grant = await stored_grant(settings, redis)
     assert retryable(failed), failed.text
     assert not revoke.called
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant
 
-    reused = await refresh(http, client, first["refresh_token"])
-    assert (reused.status_code, reused.json()["error"]) == (400, "invalid_grant")
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+    reused = await refresh(http, client, tokens["refresh_token"])
+
+    ended = await stored_grant(settings, redis)
+    assert reused.status_code == 400
+    assert reused.json()["error"] == "invalid_grant"
+    assert ended is None
 
 
 @respx.mock
-async def test_a_revocation_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_revocation_while_the_grant_is_busy_can_be_retried(
+    http, settings, redis, held_lock
+):
+    client, tokens = await sign_in(http, settings, redis)
     revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    form = {"token": tokens["access_token"], **credentials(client)}
+    form = revocation_form(client, tokens["access_token"])
 
     async with held_lock:
         failed = await http.post("/revoke", data=form)
+
+    grant = await stored_grant(settings, redis)
     # RFC 7009 section 2.2.1: the client must assume the token still works, and may retry.
     assert failed.status_code == 503, failed.text
     assert failed.headers["retry-after"]
     assert not revoke.called
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant
 
-    assert (await http.post("/revoke", data=form)).status_code == 200
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+    retried = await http.post("/revoke", data=form)
+
+    ended = await stored_grant(settings, redis)
+    assert retried.status_code == 200
+    assert ended is None
 
 
 @respx.mock
-async def test_a_refresh_that_outlasts_the_lock_still_returns_its_tokens(http, settings, redis, monkeypatch):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_refresh_that_outlasts_the_lock_still_returns_its_tokens(
+    http, settings, redis, monkeypatch
+):
+    client, tokens = await sign_in(http, settings, redis)
     monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.05)
 
-    async def slow(request):
+    async def slow_refresh(request):
         await asyncio.sleep(0.2)
         return REFRESHED
 
-    respx.post(TOKEN_URL).mock(side_effect=slow)
-    # The new tokens are saved and the old refresh token rotated: an error here would leave the client with neither.
+    respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+    # The new tokens are saved and the old refresh token rotated: an error here would leave the
+    # client with neither.
     refreshed = await refresh(http, client, tokens["refresh_token"])
+
     assert refreshed.status_code == 200, refreshed.text
+
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
-    assert (await refresh(http, client, refreshed.json()["refresh_token"])).status_code == 200
+
+    refreshed_again = await refresh(http, client, refreshed.json()["refresh_token"])
+
+    assert refreshed_again.status_code == 200
 
 
 def fail(monkeypatch: pytest.MonkeyPatch, target: object, name: str) -> None:
-    async def down(*args, **kwargs):
+    async def redis_is_down(*args, **kwargs):
         raise ConnectionError("Redis is down")
 
-    monkeypatch.setattr(target, name, down)
+    monkeypatch.setattr(target, name, redis_is_down)
 
 
 def fail_command(monkeypatch: pytest.MonkeyPatch, redis: FakeAsyncRedis, step: int) -> list[str]:
-    """Fail the Redis command number `step`, from 0. Returns the failed command's name, once it fails.
+    """Fail the Redis command number `step`, from 0. Returns the failed command's name, once it
+    fails.
 
-    Transactions aren't counted: a pipeline sends them on its own, without the client's execute_command.
+    Transactions aren't counted: a pipeline sends them on its own, without the client's
+    execute_command.
     """
-    original, sent, failed = redis.execute_command, [0], []
+    original = redis.execute_command
+    sent = 0
+    failed = []
 
     async def execute(*args, **kwargs):
-        sent[0] += 1
-        if sent[0] - 1 == step:
+        nonlocal sent
+        command_number = sent
+        sent += 1
+
+        if command_number == step:
             failed.append(args[0])
             raise ConnectionError("Redis is down")
+
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(redis, "execute_command", execute)
+
     return failed
 
 
-# Sent once the new tokens or the grant's end are written: the lock's release, and the client registration's renewal.
+# Sent once the new tokens or the grant's end are written: the lock's release, and the client
+# registration's renewal.
 AFTER_THE_WRITE = ("EVALSHA", "SCRIPT LOAD", "EXPIRE")
 
 
+async def refresh_with_a_failing_command(
+    http: httpx.AsyncClient,
+    settings: Settings,
+    redis: FakeAsyncRedis,
+    step: int,
+) -> str | None:
+    """Refreshes a new sign-in with the Redis command number `step` failing, and checks that the
+    client can carry on. Returns the failed command, or None once the refresh sends fewer
+    commands."""
+    grant_id = f"grant-{step}"
+    client, tokens = await sign_in(http, settings, redis, grant_id)
+
+    with pytest.MonkeyPatch.context() as down:
+        failed = fail_command(down, redis, step)
+        response = await refresh(http, client, tokens["refresh_token"])
+
+    if not failed:
+        return None
+
+    grant = await stored_grant(settings, redis, grant_id)
+
+    if failed[0] in AFTER_THE_WRITE:
+        assert response.status_code == 200, (failed, response.text)
+        assert grant, failed
+        assert grant.refresh_digest == digest(response.json()["refresh_token"]), failed
+    else:
+        assert retryable(response), (failed, response.text)
+        assert grant, failed
+        assert grant.refresh_digest == digest(tokens["refresh_token"]), failed
+
+        retried = await refresh(http, client, tokens["refresh_token"])
+
+        assert retried.status_code == 200, failed
+
+    return failed[0]
+
+
+async def exchange_with_a_failing_command(
+    http: httpx.AsyncClient,
+    settings: Settings,
+    redis: FakeAsyncRedis,
+    step: int,
+) -> tuple[str | None, bool]:
+    """Exchanges a new sign-in's code with the Redis command number `step` failing, and checks
+    that the client can carry on. Returns the failed command, None once the exchange sends fewer
+    commands, and whether its failure spent the code."""
+    store = Store(redis, settings.fernet_key)
+    client = await register(http)
+    code = await add_code(settings, redis, client, f"grant-{step}")
+
+    with pytest.MonkeyPatch.context() as down:
+        failed = fail_command(down, redis, step)
+        response = await exchange(http, client, code)
+
+    if not failed:
+        return None, False
+
+    if failed[0] in AFTER_THE_WRITE:
+        assert response.status_code == 200, (failed, response.text)
+
+        return failed[0], False
+
+    assert retryable(response), (failed, response.text)
+
+    # Taken by GETDEL before the tokens are written: a failure after it spends the code.
+    pending = await store.get("code", digest(code), Code)
+    is_spent = pending is None
+
+    retried = await exchange(http, client, code)
+
+    expected_status = 400 if is_spent else 200
+    expected_error = "invalid_grant" if is_spent else None
+    assert retried.status_code == expected_status, failed
+    assert retried.json().get("error") == expected_error, failed
+
+    return failed[0], is_spent
+
+
+async def revoke_with_a_failing_command(
+    http: httpx.AsyncClient,
+    settings: Settings,
+    redis: FakeAsyncRedis,
+    step: int,
+) -> str | None:
+    """Revokes a new sign-in's access token with the Redis command number `step` failing, and
+    checks that the client can carry on. Returns the failed command, or None once the revocation
+    sends fewer commands."""
+    grant_id = f"grant-{step}"
+    client, tokens = await sign_in(http, settings, redis, grant_id)
+    form = revocation_form(client, tokens["access_token"])
+
+    with pytest.MonkeyPatch.context() as down:
+        failed = fail_command(down, redis, step)
+        response = await http.post("/revoke", data=form)
+
+    if not failed:
+        return None
+
+    if failed[0] in AFTER_THE_WRITE:
+        assert response.status_code == 200, (failed, response.text)
+    else:
+        grant = await stored_grant(settings, redis, grant_id)
+        retry_after = response.headers.get("retry-after")
+        assert response.status_code == 503, (failed, response.text)
+        assert retry_after == "5", (failed, response.text)
+        assert grant, failed
+        assert grant.access_digest == digest(tokens["access_token"]), failed
+
+        retried = await http.post("/revoke", data=form)
+
+        assert retried.status_code == 200, failed
+
+    ended = await stored_grant(settings, redis, grant_id)
+    assert ended is None, failed
+
+    return failed[0]
+
+
 @respx.mock
-async def test_a_refresh_with_any_redis_command_failing_can_be_retried(http, settings, redis, monkeypatch):
+async def test_a_refresh_with_any_redis_command_failing_can_be_retried(http, settings, redis):
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
-    store, step = Store(redis, settings.fernet_key), 0
-    while True:
-        client, grant_id = await register(http), f"grant-{step}"
-        tokens = (await exchange(http, client, await add_code(settings, redis, client, grant_id))).json()
-        with monkeypatch.context() as down:
-            failed = fail_command(down, redis, step)
-            response = await refresh(http, client, tokens["refresh_token"])
-        if not failed:
+
+    for step in itertools.count():
+        failed = await refresh_with_a_failing_command(http, settings, redis, step)
+
+        if failed is None:
             break
-        grant = await store.get("grant", grant_id, Grant)
-        if failed[0] in AFTER_THE_WRITE:
-            assert response.status_code == 200, (failed, response.text)
-            assert grant and grant.refresh_digest == digest(response.json()["refresh_token"])
-        else:
-            assert retryable(response), (failed, response.text)
-            assert grant and grant.refresh_digest == digest(tokens["refresh_token"]), failed
-            assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200, failed
-        step += 1
+
     assert step >= 8
 
 
-async def test_a_code_exchange_with_any_redis_command_failing_can_be_retried_until_the_code_is_taken(
-    http, settings, redis, monkeypatch
+async def test_a_code_exchange_with_any_redis_command_failing_is_retryable_until_the_code_is_taken(
+    http, settings, redis
 ):
-    store, step, spent = Store(redis, settings.fernet_key), 0, []
-    while True:
-        client, grant_id = await register(http), f"grant-{step}"
-        code = await add_code(settings, redis, client, grant_id)
-        with monkeypatch.context() as down:
-            failed = fail_command(down, redis, step)
-            response = await exchange(http, client, code)
-        if not failed:
+    spent = []
+
+    for step in itertools.count():
+        failed, is_spent = await exchange_with_a_failing_command(http, settings, redis, step)
+
+        if failed is None:
             break
-        if failed[0] in AFTER_THE_WRITE:
-            assert response.status_code == 200, (failed, response.text)
-        else:
-            assert retryable(response), (failed, response.text)
-            # Taken by GETDEL before the tokens are written: a failure after it spends the code.
-            taken = await store.get("code", digest(code), Code) is None
-            retried = await exchange(http, client, code)
-            assert (retried.status_code, retried.json().get("error")) == ((400, "invalid_grant") if taken else (200, None))
-            spent += [failed[0]] if taken else []
-        step += 1
-    # The grant's read, just after GETDEL. Here a failed command never runs; on Redis, a GETDEL whose answer is lost has.
+
+        if is_spent:
+            spent.append(failed)
+
+    # The grant's read, just after GETDEL. Here a failed command never runs; on Redis, a GETDEL
+    # whose answer is lost has.
     assert spent == ["GET"]
 
 
 @respx.mock
-async def test_a_revocation_with_any_redis_command_failing_can_be_retried(http, settings, redis, monkeypatch):
+async def test_a_revocation_with_any_redis_command_failing_can_be_retried(http, settings, redis):
     respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    store, step = Store(redis, settings.fernet_key), 0
-    while True:
-        client, grant_id = await register(http), f"grant-{step}"
-        tokens = (await exchange(http, client, await add_code(settings, redis, client, grant_id))).json()
-        form = {"token": tokens["access_token"], **credentials(client)}
-        with monkeypatch.context() as down:
-            failed = fail_command(down, redis, step)
-            response = await http.post("/revoke", data=form)
-        if not failed:
+
+    for step in itertools.count():
+        failed = await revoke_with_a_failing_command(http, settings, redis, step)
+
+        if failed is None:
             break
-        if failed[0] in AFTER_THE_WRITE:
-            assert response.status_code == 200, (failed, response.text)
-        else:
-            assert (response.status_code, response.headers.get("retry-after")) == (503, "5"), (failed, response.text)
-            grant = await store.get("grant", grant_id, Grant)
-            assert grant and grant.access_digest == digest(tokens["access_token"]), failed
-            assert (await http.post("/revoke", data=form)).status_code == 200, failed
-        assert await store.get("grant", grant_id, Grant) is None
-        step += 1
+
     assert step >= 6
 
 
 @respx.mock
-async def test_a_refresh_whose_token_write_fails_can_be_retried(http, settings, redis, monkeypatch, caplog):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_refresh_whose_token_write_fails_can_be_retried(
+    http, settings, redis, monkeypatch, caplog
+):
+    client, tokens = await sign_in(http, settings, redis)
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
     with monkeypatch.context() as down:
         fail(down, Pipeline, "execute")
         failed = await refresh(http, client, tokens["refresh_token"])
+
+    grant = await stored_grant(settings, redis)
     assert retryable(failed), failed.text
     assert failed.headers["cache-control"] == "no-store"
     assert '"storage_failed"' in caplog.text
-    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-    assert grant and grant.refresh_digest == digest(tokens["refresh_token"])
-    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+    assert grant
+    assert grant.refresh_digest == digest(tokens["refresh_token"])
+
+    retried = await refresh(http, client, tokens["refresh_token"])
+
+    assert retried.status_code == 200
 
 
 async def test_a_code_whose_tokens_failed_to_save_is_spent(http, settings, redis, monkeypatch):
     client = await register(http)
     code = await add_code(settings, redis, client)
+
     with monkeypatch.context() as down:
         fail(down, Pipeline, "execute")
         failed = await exchange(http, client, code)
-    # Answered as any outage, but the code was taken before the write failed: the user signs in again.
+
+    # Answered as any outage, but the code was taken before the write failed: the user signs in
+    # again.
     assert retryable(failed), failed.text
+
     spent = await exchange(http, client, code)
-    assert (spent.status_code, spent.json()["error"]) == (400, "invalid_grant")
+
+    assert spent.status_code == 400
+    assert spent.json()["error"] == "invalid_grant"
 
 
 @respx.mock
-async def test_a_revocation_whose_transaction_fails_keeps_the_grant(http, settings, redis, monkeypatch):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_revocation_whose_transaction_fails_keeps_the_grant(
+    http, settings, redis, monkeypatch
+):
+    client, tokens = await sign_in(http, settings, redis)
     lightdash = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    form = {"token": tokens["access_token"], **credentials(client)}
+    form = revocation_form(client, tokens["access_token"])
 
     with monkeypatch.context() as down:
         fail(down, Pipeline, "execute")
         failed = await http.post("/revoke", data=form)
+
+    grant = await stored_grant(settings, redis)
     assert failed.status_code == 503, failed.text
     assert failed.headers["retry-after"] == "5"
     assert failed.content == b""  # RFC 7009 defines no body for it
     assert not lightdash.called
-    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-    assert grant and grant.access_digest == digest(tokens["access_token"])
+    assert grant
+    assert grant.access_digest == digest(tokens["access_token"])
 
-    assert (await http.post("/revoke", data=form)).status_code == 200
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+    retried = await http.post("/revoke", data=form)
+
+    ended = await stored_grant(settings, redis)
+    assert retried.status_code == 200
+    assert ended is None
 
 
-async def test_a_bearer_header_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch):
-    # The SDK's Bearer middleware loads the token before the endpoint, outside the routes' error handling.
+async def test_a_bearer_header_during_a_redis_outage_can_be_retried(
+    http, settings, redis, monkeypatch
+):
+    # The SDK's Bearer middleware loads the token before the endpoint, outside the routes' error
+    # handling.
     client = await register(http)
     bearer = {"Authorization": "Bearer some-token"}
+    refresh_form = {"grant_type": "refresh_token", "refresh_token": "r", **credentials(client)}
     fail(monkeypatch, redis, "execute_command")
-    token = await http.post(
-        "/token", headers=bearer, data={"grant_type": "refresh_token", "refresh_token": "r", **credentials(client)}
-    )
+
+    token = await http.post("/token", headers=bearer, data=refresh_form)
+    revoked = await http.post("/revoke", headers=bearer, data=revocation_form(client, "t"))
+
     assert retryable(token), token.text
-    revoked = await http.post("/revoke", headers=bearer, data={"token": "t", **credentials(client)})
     assert revoked.status_code == 503, revoked.text
 
 
-@pytest.mark.parametrize("failing", [(Lock, "do_release"), (FakeAsyncRedis, "expire")], ids=["lock release", "client renewal"])
+@pytest.mark.parametrize(
+    ("target", "name"),
+    [(Lock, "do_release"), (FakeAsyncRedis, "expire")],
+    ids=["lock release", "client renewal"],
+)
 @respx.mock
-async def test_a_refresh_saved_before_redis_fails_still_returns_its_tokens(http, settings, redis, monkeypatch, failing):
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+async def test_a_refresh_saved_before_redis_fails_still_returns_its_tokens(
+    http, settings, redis, monkeypatch, target, name
+):
+    client, tokens = await sign_in(http, settings, redis)
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
     with monkeypatch.context() as down:
-        fail(down, *failing)
+        fail(down, target, name)
         refreshed = await refresh(http, client, tokens["refresh_token"])
+
+    grant = await stored_grant(settings, redis)
     # The old refresh token is rotated by then: an error would leave the client with neither.
     assert refreshed.status_code == 200, refreshed.text
-    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-    assert grant and grant.refresh_digest == digest(refreshed.json()["refresh_token"])
+    assert grant
+    assert grant.refresh_digest == digest(refreshed.json()["refresh_token"])
 
 
 async def test_a_redis_outage_elsewhere_is_still_a_server_error(settings, redis, monkeypatch):
     transport = httpx.ASGITransport(asgi_app(settings, redis), raise_app_exceptions=False)
+    fail(monkeypatch, redis, "execute_command")
+
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as http:
-        fail(monkeypatch, redis, "execute_command")
         consent = await http.get("/oauth/consent", params={"transaction": "t"})
+
     assert consent.status_code == 500
 
 
 async def test_large_token_bodies_are_refused_before_they_are_read(http):
-    basic = {"Authorization": "Basic " + base64.b64encode(b"client:secret").decode()}
-    declared = await http.post("/token", headers=basic, content=b"a=" + b"x" * 100_000)
-    assert declared.status_code == 413
+    headers = {"Authorization": basic(b"client:secret")}
+    too_large = b"a=" + b"x" * 100_000
 
     async def chunks():
         for _ in range(100):
             yield b"x" * 1024
 
-    streamed = await http.post("/revoke", headers=basic, content=chunks())
+    declared = await http.post("/token", headers=headers, content=too_large)
+    streamed = await http.post("/revoke", headers=headers, content=chunks())
+
+    assert declared.status_code == 413
     assert streamed.status_code == 413
 
 
 async def test_the_audit_log_is_one_json_line_per_call(caplog):
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
     name = 'list_projects\n{"event": "tool_call", "user": "admin", "tool": "delete_everything"}'
-    ctx = SimpleNamespace(method="tools/call", params={"name": name, "arguments": {"body": "x" * 10_000, "dry_run": False}})
+    arguments = {"body": "x" * 10_000, "dry_run": False}
+    context = SimpleNamespace(method="tools/call", params={"name": name, "arguments": arguments})
 
     async def call_next(_):
         return {"isError": False}
 
-    await audit(ctx, call_next)
-    [line] = [r.getMessage() for r in caplog.records if r.name == "lightdash_mcp.audit"]
-    assert "\n" not in line
+    await audit(context, call_next)
+
+    [line] = audit_messages(caplog)
     logged = json.loads(line)
-    assert (logged["event"], logged["tool"], logged["error"]) == ("tool_call", name, False)
+    assert "\n" not in line
+    assert logged["event"] == "tool_call"
+    assert logged["tool"] == name
+    assert logged["error"] is False
     assert logged["arguments"]["dry_run"] is False
     assert len(logged["arguments"]["body"]) == MAX_VALUE + 3
 
@@ -490,78 +759,106 @@ async def test_the_audit_log_is_one_json_line_per_call(caplog):
 async def test_the_audit_log_follows_a_sign_in_without_its_secrets(http, settings, redis, caplog):
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
     client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    code = await add_code(settings, redis, client)
+    exchanged = await exchange(http, client, code)
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
     respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    tokens = (await refresh(http, client, tokens["refresh_token"])).json()
-    await http.post("/revoke", data={"token": tokens["refresh_token"], **credentials(client)})
+    refreshed = await refresh(http, client, exchanged.json()["refresh_token"])
+    tokens = refreshed.json()
+    revocation = {"token": tokens["refresh_token"], **credentials(client)}
 
-    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
-    assert [line["event"] for line in lines] == ["client_registered", "token_revoked", "grant_ended"]
+    await http.post("/revoke", data=revocation)
+
+    lines = audit_lines(caplog)
+    events = [line["event"] for line in lines]
+    secrets = [
+        client["client_secret"],
+        tokens["access_token"],
+        tokens["refresh_token"],
+        "ld-refresh-2",
+        "lightdash-secret",
+    ]
+    leaked = [secret for secret in secrets if secret in caplog.text]
+    assert events == [
+        "client_registered",
+        "token_revoked",
+        "grant_ended",
+    ]
     assert lines[-1]["reason"] == "revoked"
-    secrets = [client["client_secret"], tokens["access_token"], tokens["refresh_token"], "ld-refresh-2", "lightdash-secret"]
-    assert not [secret for secret in secrets if secret in caplog.text]
+    assert not leaked
 
 
 @respx.mock
-async def test_a_revocation_while_the_grant_is_busy_logs_no_token_revoked(http, settings, redis, held_lock, caplog):
+async def test_a_revocation_while_the_grant_is_busy_logs_no_token_revoked(
+    http, settings, redis, held_lock, caplog
+):
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
     respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
-    client = await register(http)
-    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
-    async with held_lock:
-        failed = await http.post("/revoke", data={"token": tokens["access_token"], **credentials(client)})
+    client, tokens = await sign_in(http, settings, redis)
+    form = revocation_form(client, tokens["access_token"])
 
+    async with held_lock:
+        failed = await http.post("/revoke", data=form)
+
+    grant = await stored_grant(settings, redis)
+    lines = audit_lines(caplog)
+    events = [line["event"] for line in lines]
+    busy = lines[-1]
+    busy_records = [record for record in caplog.records if "revoke_busy" in record.getMessage()]
+    busy_levels = [record.levelno for record in busy_records]
     assert failed.status_code == 503, failed.text
-    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
-    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
-    assert [line["event"] for line in lines] == ["client_registered", "revoke_busy"]
-    assert (lines[-1]["grant"], lines[-1]["subject"], lines[-1]["client_id"]) == ("grant", "user", client["client_id"])
-    assert [r.levelno for r in caplog.records if "revoke_busy" in r.getMessage()] == [logging.WARNING]
+    assert grant
+    assert events == ["client_registered", "revoke_busy"]
+    assert busy["grant"] == "grant"
+    assert busy["subject"] == "user"
+    assert busy["client_id"] == client["client_id"]
+    assert busy_levels == [logging.WARNING]
 
 
 async def test_stopping_closes_the_http_client_and_redis(settings, redis, monkeypatch):
     closed = []
-    monkeypatch.setattr(Store, "close", lambda self: closed.append("redis") or _done())
-    monkeypatch.setattr(httpx.AsyncClient, "aclose", lambda self: _fail())
-    app = create_server(settings, redis).streamable_http_app()
+
+    async def close_redis(self) -> None:
+        closed.append("redis")
+
+    async def fail_to_close(self) -> None:
+        raise RuntimeError("aclose failed")
+
+    monkeypatch.setattr(Store, "close", close_redis)
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", fail_to_close)
+    server = create_server(settings, redis)
+    app = server.streamable_http_app()
+
     with pytest.raises(RuntimeError, match="aclose failed"):
         async with app.router.lifespan_context(app):
             pass
+
     # Closed even though closing the HTTP client failed.
     assert closed == ["redis"]
 
 
-async def _done() -> None:
-    pass
-
-
-async def _fail() -> None:
-    raise RuntimeError("aclose failed")
-
-
 def test_redis_requests_time_out(settings, monkeypatch):
     created = {}
-    from_url = server_module.Redis.from_url
-    monkeypatch.setattr(server_module.Redis, "from_url", lambda url, **options: created.update(options) or FakeAsyncRedis())
+    real_from_url = server_module.Redis.from_url
+
+    def from_url(url, **options):
+        created.update(options)
+        return FakeAsyncRedis()
+
+    monkeypatch.setattr(server_module.Redis, "from_url", from_url)
+
     create_server(settings)
-    assert created["socket_timeout"] and created["socket_connect_timeout"]
-    assert isinstance(created["retry"], Retry) and created["retry"].get_retries() == 1  # the async Retry, not redis.retry's
+
+    retry = created["retry"]
+    redis = real_from_url(settings.redis_url, **created)
+    connection = redis.connection_pool.make_connection()
+    assert created["socket_timeout"]
+    assert created["socket_connect_timeout"]
+    # The async Retry, not redis.retry's.
+    assert isinstance(retry, Retry)
+    assert retry.get_retries() == 1
     # The commands retry with the pool's connections' policy, not the client's.
-    assert from_url(settings.redis_url, **created).connection_pool.make_connection().retry.get_retries() == 1
-
-
-def basic(credentials: bytes) -> str:
-    return "Basic " + base64.b64encode(credentials).decode()
-
-
-def code_form(code: str) -> dict:
-    return {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT,
-        "code_verifier": VERIFIER,
-    }
+    assert connection.retry.get_retries() == 1
 
 
 @pytest.mark.parametrize(
@@ -580,25 +877,28 @@ def code_form(code: str) -> dict:
     ],
 )
 def test_basic_credentials_are_read_strictly(authorization, expected):
-    assert _basic_credentials(authorization) == expected
+    result = _basic_credentials(authorization)
+
+    assert result == expected
 
 
 async def test_a_garbage_basic_header_is_refused_without_a_server_error(http, settings, redis):
     client = await register(http, "client_secret_basic")
     code = await add_code(settings, redis, client)
     form = code_form(code) | {"client_id": client["client_id"]}
-
     garbage = ["Basic not-base64!", basic(b"\xff\xfe:x"), basic(b"no-separator"), "Basic "]
 
     for authorization in garbage:
-        response = await http.post("/token", headers={"Authorization": authorization}, data=form)
+        headers = {"Authorization": authorization}
+        response = await http.post("/token", headers=headers, data=form)
 
         assert response.status_code == 401, authorization
         assert response.json()["error"] == "invalid_client"
 
     # The refused requests didn't use the code up.
-    header = basic(f"{client['client_id']}:{client['client_secret']}".encode())
-    tokens = await http.post("/token", headers={"Authorization": header}, data=code_form(code))
+    headers = {"Authorization": basic_for(client)}
+    tokens = await http.post("/token", headers=headers, data=code_form(code))
+
     assert tokens.status_code == 200, tokens.text
 
 
@@ -608,8 +908,9 @@ async def test_only_the_credentials_missing_from_the_form_are_added():
 
     async def app(scope, receive, send):
         message = await receive()
+        headers = dict(scope["headers"])
         received["form"] = parse_qs(message["body"].decode())
-        received["length"] = dict(scope["headers"])[b"content-length"]
+        received["length"] = headers[b"content-length"]
 
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
@@ -618,93 +919,105 @@ async def test_only_the_credentials_missing_from_the_form_are_added():
         (b"authorization", basic(b"B:secret-b").encode()),
         (b"content-length", str(len(body)).encode()),
     ]
-    scope = {"type": "http", "method": "POST", "path": "/token", "headers": headers}
-    await BasicAuthClientId(app)(scope, receive, None)
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/token",
+        "headers": headers,
+    }
+    middleware = BasicAuthClientId(app)
 
+    await middleware(scope, receive, None)
+
+    added = b"&client_secret=secret-b"
     assert received["form"] == {
         "grant_type": ["authorization_code"],
         "client_id": ["A"],
         "client_secret": ["secret-b"],
     }
-    assert received["length"] == str(len(body) + len(b"&client_secret=secret-b")).encode()
+    assert received["length"] == str(len(body) + len(added)).encode()
 
 
 async def test_a_basic_header_cannot_authenticate_another_form_client(http, settings, redis):
     victim = await register(http)
     attacker = await register(http)
     code = await add_code(settings, redis, victim)
-    header = basic(f"{attacker['client_id']}:{attacker['client_secret']}".encode())
-
+    headers = {"Authorization": basic_for(attacker)}
     form = code_form(code) | {"client_id": victim["client_id"]}
-    response = await http.post("/token", headers={"Authorization": header}, data=form)
 
-    assert (response.status_code, response.json()["error"]) == (401, "invalid_client")
-    assert (await exchange(http, victim, code)).status_code == 200
+    response = await http.post("/token", headers=headers, data=form)
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_client"
+
+    exchanged = await exchange(http, victim, code)
+
+    assert exchanged.status_code == 200
 
 
-async def test_requests_to_mcp_need_an_allowed_host_and_origin(redis):
-    settings = make_settings(public_url="https://mcp.example.com")
+async def add_access(settings: Settings, redis: FakeAsyncRedis, token: str) -> None:
+    """A signed-in user whose access token to this server is `token`."""
     store = Store(redis, settings.fernet_key)
-    token = "our-access"
     grant = Grant(
         client_id="client",
         subject="user",
         access_token="ld-access",
         refresh_token="ld-refresh",
-        expires_at=time.time() + 3600,
+        expires_at=time.time() + TOKEN_LIFETIME,
         access_digest=digest(token),
     )
-    access = Access(token=token, client_id="client", scopes=[], subject="user", grant_id="grant")
+    access = Access(
+        token=token,
+        client_id="client",
+        scopes=[],
+        subject="user",
+        grant_id="grant",
+    )
+
     await store.put("grant", "grant", grant)
     await store.put("access", digest(token), access)
-    security = transport_security(settings)
-    app = create_server(settings, redis).streamable_http_app(transport_security=security)
-    initialize = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "1"},
-        },
-    }
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
-    cases = [
-        ("evil.example", None, 421),
-        ("mcp.example.com", "https://evil.example", 403),
-        ("mcp.example.com", "http://mcp.example.com", 403),
-        ("mcp.example.com", "https://mcp.example.com", 200),
-        ("localhost:8000", "http://localhost:8000", 200),
-    ]
 
+
+async def test_requests_to_mcp_need_an_allowed_host_and_origin(redis):
+    settings = make_settings(public_url="https://mcp.example.com")
+    token = "our-access"
+    await add_access(settings, redis, token)
+    security = transport_security(settings)
+    server = create_server(settings, redis)
+    app = server.streamable_http_app(transport_security=security)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+    }
+    cases = [
+        ({"Host": "evil.example"}, 421),
+        ({"Host": "mcp.example.com", "Origin": "https://evil.example"}, 403),
+        ({"Host": "mcp.example.com", "Origin": "http://mcp.example.com"}, 403),
+        ({"Host": "mcp.example.com", "Origin": "https://mcp.example.com"}, 200),
+        ({"Host": "localhost:8000", "Origin": "http://localhost:8000"}, 200),
+    ]
     transport = httpx.ASGITransport(app)
     http = httpx.AsyncClient(transport=transport, base_url="https://mcp.example.com")
-    async with app.router.lifespan_context(app), http:
-        for host, origin, status in cases:
-            sent = headers | {"Host": host} | ({"Origin": origin} if origin else {})
-            response = await http.post("/mcp", headers=sent, json=initialize)
 
-            assert response.status_code == status, (host, origin, response.text)
+    async with app.router.lifespan_context(app), http:
+        for host_and_origin, status in cases:
+            sent = headers | host_and_origin
+            response = await http.post("/mcp", headers=sent, json=INITIALIZE)
+
+            assert response.status_code == status, (host_and_origin, response.text)
 
 
 async def test_a_code_exchange_keeps_the_client(http, settings, redis):
     client = await register(http)
     key = f"lightdash-mcp:client:{client['client_id']}"
     await redis.expire(key, 60)
+    code = await add_code(settings, redis, client)
 
-    response = await exchange(http, client, await add_code(settings, redis, client))
+    response = await exchange(http, client, code)
 
+    ttl = await redis.ttl(key)
     assert response.status_code == 200, response.text
-    assert await redis.ttl(key) > CLIENT_TTL - 60
-
-
-def audit_lines(caplog) -> list[dict]:
-    return [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
-
-
-def tool_call() -> SimpleNamespace:
-    return SimpleNamespace(method="tools/call", params={"name": "list_projects", "arguments": {}})
+    assert ttl > CLIENT_TTL - 60
 
 
 async def test_the_audit_log_marks_failed_calls(caplog):
@@ -724,24 +1037,31 @@ async def test_the_audit_log_marks_failed_calls(caplog):
 
     with pytest.raises(RuntimeError, match="boom"):
         await audit(tool_call(), raising)
-    assert await audit(tool_call(), error_dict) == {"isError": True}
-    assert (await audit(tool_call(), error_model)).is_error
+
+    from_dict = await audit(tool_call(), error_dict)
+    from_model = await audit(tool_call(), error_model)
     await audit(tool_call(), success_model)
 
-    assert [line["error"] for line in audit_lines(caplog)] == [True, True, True, False]
+    errors = [line["error"] for line in audit_lines(caplog)]
+    assert from_dict == {"isError": True}
+    assert from_model.is_error
+    assert errors == [True, True, True, False]
 
 
 async def test_the_audit_log_leaves_out_other_requests(caplog):
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    others = [
+        SimpleNamespace(method="tools/list", params={"name": "list_projects"}),
+        SimpleNamespace(method="tools/call", params=None),
+    ]
 
     async def call_next(_):
         return {"tools": []}
 
-    for ctx in (
-        SimpleNamespace(method="tools/list", params={"name": "list_projects"}),
-        SimpleNamespace(method="tools/call", params=None),
-    ):
-        assert await audit(ctx, call_next) == {"tools": []}
+    for context in others:
+        result = await audit(context, call_next)
+
+        assert result == {"tools": []}
 
     assert audit_lines(caplog) == []
 
@@ -750,7 +1070,9 @@ def test_logged_arguments_are_capped():
     many = {f"argument{number}": number for number in range(MAX_ITEMS + 5)}
     numbers = list(range(1000))
 
-    assert list(clip_arguments(many)) == list(many)[:MAX_ITEMS]
+    kept_names = list(clip_arguments(many))
+
+    assert kept_names == list(many)[:MAX_ITEMS]
     assert clip_arguments("x" * 1000) == "x" * MAX_VALUE + "..."
     assert clip_arguments([1, 2]) == [1, 2]
     assert clip_arguments(numbers) == json.dumps(numbers)[:MAX_VALUE] + "..."

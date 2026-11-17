@@ -43,8 +43,12 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 130
+line-length = 100
 target-version = "py315"
+
+[tool.ruff.lint]
+# Lines ruff format can't wrap, such as comments and strings, are kept to the limit too.
+extend-select = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 # The integration tests drive the server over blocking HTTP on purpose.
