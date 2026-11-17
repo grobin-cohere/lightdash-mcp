@@ -508,6 +508,10 @@ class LightdashOAuthProvider:
 
     async def _refresh_lightdash(self, grant_id: str, grant: Grant) -> str:
         """Refreshes the grant's Lightdash tokens and saves them. The caller holds the grant's lock."""
+        # Its TTL ends the grant at its lifetime, give or take a second: past it, don't renew it upstream.
+        if time.time() >= grant.created_at + GRANT_LIFETIME:
+            await self._end_grant(grant_id, "lifetime_ended")
+            raise SignInRequired
         try:
             async with asyncio.timeout(REFRESH_TIMEOUT):
                 response = await self.http.post(
