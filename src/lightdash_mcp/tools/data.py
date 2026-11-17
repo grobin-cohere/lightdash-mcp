@@ -224,6 +224,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 results = await _run(ld, project_uuid, "chart", {"chartUuid": chart_uuid}, MAX_ROWS)
             else:
                 dashboard = await ld.get(f"/api/v1/dashboards/{dashboard_uuid}")
+                if dashboard.get("projectUuid") != project_uuid:
+                    raise ToolError("This dashboard is not in this project.")
                 tile = next((t for t in dashboard["tiles"] if t["properties"].get("savedChartUuid") == chart_uuid), None)
                 if tile is None:
                     raise ToolError("This chart is not on the dashboard. See get_dashboard.")

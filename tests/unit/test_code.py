@@ -14,13 +14,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 from lightdash_mcp.auth.provider import Access, Grant
 from lightdash_mcp.auth.store import Store
 from lightdash_mcp.config import Settings
-from lightdash_mcp.lightdash import LightdashClient, LightdashError
+from lightdash_mcp.lightdash import LightdashError
 from lightdash_mcp.server import asgi_app, create_server
 from lightdash_mcp.tools.code import _require, check_chart, check_dashboard, keep_existing, preview, save
 from lightdash_mcp.tools.common import resolve_chart
 
-LIGHTDASH = "http://lightdash.test"
-PROJECT = "3675b69e-8324-4110-bdca-059031aa8da3"
+from .conftest import LIGHTDASH, PROJECT
+
 CHART_UUID = "d83eaf7e-e041-4a89-af83-e64450cfd524"
 DASHBOARD_UUID = "4c2b1a09-8f7e-4d6c-9b5a-3e2f1d0c9b8a"
 
@@ -75,8 +75,16 @@ def mock_lightdash(existing: list[dict] | None = None, spaces: list[str] = ("my_
     )
 
 
-async def client(http: httpx.AsyncClient) -> LightdashClient:
-    return LightdashClient(http, "token")
+@respx.mock
+async def test_chart_fields_must_exist_in_the_explore(client):
+    mock_lightdash()
+
+    await check_chart(client, PROJECT, CHART)  # table calculations count as fields
+
+    profit = {"filters": {"metrics": {"and": [{"target": {"fieldId": "orders_profit"}}]}}}
+    query = CHART["metricQuery"] | profit
+    with pytest.raises(ToolError, match="Unknown fields in orders: orders_profit"):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": query})
 
 
 @pytest.fixture
@@ -109,23 +117,11 @@ async def call():
 
 
 @respx.mock
-async def test_chart_fields_must_exist_in_the_explore():
+async def test_charts_can_use_hidden_fields(client):
     mock_lightdash()
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        await check_chart(ld, PROJECT, CHART)  # table calculations count as fields
-        query = CHART["metricQuery"] | {"filters": {"metrics": {"and": [{"target": {"fieldId": "orders_profit"}}]}}}
-        with pytest.raises(ToolError, match="Unknown fields in orders: orders_profit"):
-            await check_chart(ld, PROJECT, CHART | {"metricQuery": query})
+    query = CHART["metricQuery"] | {"metrics": ["orders_cost"]}
 
-
-@respx.mock
-async def test_charts_can_use_hidden_fields():
-    mock_lightdash()
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        await check_chart(
-            await client(http), PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | {"metrics": ["orders_cost"]}}
-        )
+    await check_chart(client, PROJECT, CHART | {"metricQuery": query})
 
 
 @respx.mock
@@ -136,31 +132,32 @@ async def test_charts_can_use_hidden_fields():
         ({"sorts": [{"descending": True}]}, "Each of metricQuery.sorts needs fieldId"),
         ({"additionalMetrics": [{"name": "x"}]}, "Each of metricQuery.additionalMetrics needs table and name"),
         ({"dimensions": [{"fieldId": "orders_status"}]}, "metricQuery.dimensions must be a list of field IDs"),
+        ({"customDimensions": [{"name": "g"}]}, "Each of metricQuery.customDimensions needs id"),
+        ({"customDimensions": {"id": "g"}}, "Each of metricQuery.customDimensions needs id"),
     ],
 )
-async def test_malformed_charts_are_refused_with_a_reason(change, error):
+async def test_malformed_charts_are_refused_with_a_reason(client, change, error):
     mock_lightdash()
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        with pytest.raises(ToolError, match=error):
-            await check_chart(await client(http), PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | change})
+    query = CHART["metricQuery"] | change
+
+    with pytest.raises(ToolError, match=error):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": query})
 
 
 @respx.mock
-async def test_the_explore_must_be_a_name_and_defaults_to_the_table():
+async def test_the_explore_must_be_a_name_and_defaults_to_the_table(client):
     mock_lightdash()
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        with pytest.raises(ToolError, match="Invalid explore '../org'"):
-            await check_chart(ld, PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | {"exploreName": "../org"}})
-        with pytest.raises(ToolError, match="metricQuery must be an object"):
-            await check_chart(ld, PROJECT, CHART | {"metricQuery": ["orders_revenue"]})
-        assert not respx.calls
+    with pytest.raises(ToolError, match="Invalid explore '../org'"):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": CHART["metricQuery"] | {"exploreName": "../org"}})
+    with pytest.raises(ToolError, match="metricQuery must be an object"):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": ["orders_revenue"]})
+    assert not respx.calls
 
-        query = {k: v for k, v in CHART["metricQuery"].items() if k != "exploreName"}
-        await check_chart(ld, PROJECT, CHART | {"metricQuery": query})
-        assert respx.calls.last.request.url.path == f"/api/v1/projects/{PROJECT}/explores/orders"
-        with pytest.raises(ToolError, match="Invalid explore '../org'"):
-            await check_chart(ld, PROJECT, CHART | {"tableName": "../org", "metricQuery": query})
+    query = {k: v for k, v in CHART["metricQuery"].items() if k != "exploreName"}
+    await check_chart(client, PROJECT, CHART | {"metricQuery": query})
+    assert respx.calls.last.request.url.path == f"/api/v1/projects/{PROJECT}/explores/orders"
+    with pytest.raises(ToolError, match="Invalid explore '../org'"):
+        await check_chart(client, PROJECT, CHART | {"tableName": "../org", "metricQuery": query})
 
 
 def test_charts_need_their_keys_and_a_url_safe_slug():
@@ -172,19 +169,20 @@ def test_charts_need_their_keys_and_a_url_safe_slug():
 
 
 @respx.mock
-async def test_preview_says_whether_it_creates_or_replaces():
+async def test_preview_says_whether_it_creates_or_replaces(client):
     mock_lightdash(spaces=[])
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        created = await preview(ld, PROJECT, "charts", CHART, None)
+
+    created = await preview(client, PROJECT, "charts", CHART, None)
+
     assert created["wouldCreate"]["slug"] == "revenue-per-week"
     assert "visible only to you" in created["wouldCreate"]["newSpace"]
 
     respx.reset()
     mock_lightdash()
     existing = CHART | {"name": "Old revenue", "spaceSlug": "finance", "updatedAt": "2026-11-01", "version": 1}
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        replaced = await preview(await client(http), PROJECT, "charts", CHART, existing)
+
+    replaced = await preview(client, PROJECT, "charts", CHART, existing)
+
     assert replaced["next"].startswith("Nothing is saved yet. Call save_chart again with dry_run=false")
     assert {k: v for k, v in replaced.items() if k != "next"} == {
         "wouldUpdate": {
@@ -198,18 +196,21 @@ async def test_preview_says_whether_it_creates_or_replaces():
 
 
 @respx.mock
-async def test_nested_spaces_are_found_by_their_path():
+async def test_nested_spaces_are_found_by_their_path(client):
     mock_lightdash(spaces=["finance", "finance.my_team"])
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        nested = await preview(ld, PROJECT, "charts", CHART | {"spaceSlug": "finance/my-team"}, None)
-        top_level = await preview(ld, PROJECT, "charts", CHART | {"spaceSlug": "my-team"}, None)
+
+    nested_chart = CHART | {"spaceSlug": "finance/my-team"}
+    top_level_chart = CHART | {"spaceSlug": "my-team"}
+
+    nested = await preview(client, PROJECT, "charts", nested_chart, None)
+    top_level = await preview(client, PROJECT, "charts", top_level_chart, None)
+
     assert "newSpace" not in nested["wouldCreate"]
     assert "newSpace" in top_level["wouldCreate"]
 
 
 @respx.mock
-async def test_replacing_a_dashboard_keeps_what_it_leaves_out():
+async def test_replacing_a_dashboard_keeps_what_it_leaves_out(client):
     tile = {"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": {"content": "Hi"}}
     filters = {"dimensions": [{"target": {"fieldId": "orders_status"}, "operator": "equals"}], "metrics": []}
     existing = {
@@ -228,8 +229,9 @@ async def test_replacing_a_dashboard_keeps_what_it_leaves_out():
     assert keep_existing("dashboards", given | {"tabs": []}, existing)["tabs"] == []
 
     mock_lightdash()
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        result = await preview(await client(http), PROJECT, "dashboards", item, existing)
+
+    result = await preview(client, PROJECT, "dashboards", item, existing)
+
     assert result["wouldUpdate"]["changes"] == ["tiles"]
     assert result["wouldUpdate"]["before"] == {"tiles": 2, "tabs": 1, "filters": 1}
     assert result["wouldUpdate"]["after"] == {"tiles": 1, "tabs": 1, "filters": 1}
@@ -353,23 +355,23 @@ async def test_code_is_read_by_slug(call):
 
 
 @respx.mock
-async def test_save_raises_a_401_from_validation():
+async def test_save_raises_a_401_from_validation(client):
     upsert = mock_upsert()
     mock_validate(answer=httpx.Response(401, json={"error": {"message": "Unauthorized"}}))
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        with pytest.raises(LightdashError) as error:
-            await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
+    with pytest.raises(LightdashError) as error:
+        await save(client, PROJECT, "charts", CHART, LIGHTDASH)
     assert error.value.status == 401 and upsert.called
 
 
 @respx.mock
-async def test_save_keeps_new_spaces_private_forces_the_update_and_validates():
+async def test_save_keeps_new_spaces_private_forces_the_update_and_validates(client):
     upsert = mock_upsert()
     respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/validate/chart/{CHART_UUID}").mock(
         return_value=httpx.Response(200, json={"results": {"errors": [{"fieldName": "orders_x", "error": "no longer exists"}]}})
     )
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        result = await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
+
+    result = await save(client, PROJECT, "charts", CHART, LIGHTDASH)
+
     body = json.loads(upsert.calls[0].request.content)
     assert (body["publicSpaceCreate"], body["skipSpaceCreate"]) == (False, False)
     # Lightdash skips a chart update whose name, description and slug are unchanged unless it is forced.
@@ -390,36 +392,31 @@ async def test_save_keeps_new_spaces_private_forces_the_update_and_validates():
         (httpx.ReadTimeout("timed out"), "didn't answer its validation"),
     ],
 )
-async def test_save_reports_a_failed_validation_without_hiding_the_save(answer, reason):
+async def test_save_reports_a_failed_validation_without_hiding_the_save(client, answer, reason):
     mock_upsert("create")
     respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/validate/chart/{CHART_UUID}").mock(side_effect=[answer])
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        result = await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
+
+    result = await save(client, PROJECT, "charts", CHART, LIGHTDASH)
+
     assert (result["action"], result["uuid"]) == ("create", CHART_UUID)
     assert reason in result["validationFailed"] and "validationErrors" not in result
 
 
 @respx.mock
-async def test_dashboard_tiles_are_checked_and_unsaved_charts_listed():
+async def test_dashboard_tiles_are_checked_and_unsaved_charts_listed(client):
     tile = {"type": "saved_chart", "x": 0, "y": 0, "w": 36, "h": 8, "properties": {"chartSlug": "revenue-per-week"}}
+    markdown = {"type": "markdown", "x": 0, "y": 0, "properties": {}}
+    no_slug = "Tile 0 is a saved_chart tile without properties.chartSlug"
     mock_lightdash(missing=["revenue-per-week"])
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        assert await check_dashboard(ld, PROJECT, {"tiles": [tile]}) == ["revenue-per-week"]
-        with pytest.raises(ToolError, match="Tile 0 is a saved_chart tile without properties.chartSlug"):
-            await check_dashboard(ld, PROJECT, {"tiles": [tile | {"properties": {}}]})
-        with pytest.raises(ToolError, match="Tile 0 needs w, h"):
-            await check_dashboard(ld, PROJECT, {"tiles": [{"type": "markdown", "x": 0, "y": 0, "properties": {}}]})
-        with pytest.raises(ToolError, match="Tile 0 properties must be an object"):
-            await check_dashboard(ld, PROJECT, {"tiles": [tile | {"properties": "revenue-per-week"}]})
-        with pytest.raises(ToolError, match="tiles must be a list"):
-            await check_dashboard(ld, PROJECT, {"tiles": {"0": tile}})
+
+    assert await check_dashboard(client, PROJECT, {"tiles": [tile]}) == ["revenue-per-week"]
+    with pytest.raises(ToolError, match=no_slug):
+        await check_dashboard(client, PROJECT, {"tiles": [tile | {"properties": {}}]})
+    with pytest.raises(ToolError, match="Tile 0 needs w, h"):
+        await check_dashboard(client, PROJECT, {"tiles": [markdown]})
 
 
-async def test_slugs_cannot_reach_other_endpoints():
-    settings = Settings(
-        _env_file=None, lightdash_client_id="id", lightdash_client_secret="secret", fernet_key=Fernet.generate_key().decode()
-    )
+async def test_slugs_cannot_reach_other_endpoints(settings):
     server = create_server(settings)
     for name, arguments in [
         ("get_chart_code", {"project_uuid": PROJECT, "slug": "../../org"}),
@@ -429,11 +426,8 @@ async def test_slugs_cannot_reach_other_endpoints():
             await server.call_tool(name, arguments)
 
 
-async def test_token_endpoint_accepts_a_client_id_sent_only_in_the_basic_header():
-    settings = Settings(
-        _env_file=None, lightdash_client_id="id", lightdash_client_secret="secret", fernet_key=Fernet.generate_key().decode()
-    )
-    app = asgi_app(settings, FakeAsyncRedis())
+async def test_token_endpoint_accepts_a_client_id_sent_only_in_the_basic_header(settings, redis):
+    app = asgi_app(settings, redis)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://localhost:8000") as http:
         registered = (
             await http.post(
@@ -468,16 +462,106 @@ async def test_token_endpoint_accepts_a_client_id_sent_only_in_the_basic_header(
 
 
 @respx.mock
-async def test_charts_can_be_given_by_slug_within_the_project():
+async def test_charts_can_be_given_by_slug_within_the_project(client):
     respx.get(f"{LIGHTDASH}/api/v1/saved/revenue-per-week").mock(
         return_value=httpx.Response(200, json={"results": {"uuid": CHART_UUID, "projectUuid": PROJECT}})
     )
     respx.get(f"{LIGHTDASH}/api/v1/saved/other-project-chart").mock(
         return_value=httpx.Response(200, json={"results": {"uuid": CHART_UUID, "projectUuid": "another"}})
     )
-    async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
-        ld = await client(http)
-        assert await resolve_chart(ld, PROJECT, CHART_UUID) == CHART_UUID
-        assert await resolve_chart(ld, PROJECT, "revenue-per-week") == CHART_UUID
-        with pytest.raises(ToolError, match="No chart with slug other-project-chart in this project"):
-            await resolve_chart(ld, PROJECT, "other-project-chart")
+
+    assert await resolve_chart(client, PROJECT, CHART_UUID) == CHART_UUID
+    assert await resolve_chart(client, PROJECT, "revenue-per-week") == CHART_UUID
+    with pytest.raises(ToolError, match="No chart with slug other-project-chart in this project"):
+        await resolve_chart(client, PROJECT, "other-project-chart")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("tiles", "error"),
+    [
+        ({"type": "markdown"}, "tiles must be a list"),
+        (["markdown"], "Tile 0 needs type, x, y, w, h, properties"),
+        (
+            [{"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": "Hi"}],
+            "Tile 0 properties must be an object",
+        ),
+    ],
+)
+async def test_malformed_dashboard_tiles_are_refused_with_a_reason(client, tiles, error):
+    with pytest.raises(ToolError, match=error):
+        await check_dashboard(client, PROJECT, {"tiles": tiles})
+
+
+@respx.mock
+async def test_dashboards_without_chart_tiles_do_not_look_up_charts(client):
+    charts = respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/code/charts").mock(
+        return_value=httpx.Response(200, json={"results": {"charts": [], "missingIds": []}}),
+    )
+    markdown = {"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": {}}
+
+    missing = await check_dashboard(client, PROJECT, {"tiles": [markdown]})
+
+    assert missing == []
+    assert not charts.called
+
+
+@respx.mock
+async def test_custom_dimensions_and_additional_metrics_count_as_fields(client):
+    mock_lightdash()
+    query = CHART["metricQuery"] | {
+        "dimensions": ["orders_order_date_week", "status_group"],
+        "metrics": ["orders_revenue", "orders_margin"],
+        "customDimensions": [{"id": "status_group", "name": "Status group"}],
+        "additionalMetrics": [{"table": "orders", "name": "margin"}],
+        "sorts": [{"fieldId": "orders_margin", "descending": True}],
+    }
+
+    await check_chart(client, PROJECT, CHART | {"metricQuery": query})
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("change", "unknown"),
+    [
+        ({"sorts": [{"fieldId": "orders_rank", "descending": False}]}, "orders_rank"),
+        (
+            {
+                "filters": {
+                    "dimensions": {
+                        "id": "outer",
+                        "or": [{"id": "inner", "and": [{"target": {"fieldId": "orders_deep"}}]}],
+                    }
+                }
+            },
+            "orders_deep",
+        ),
+    ],
+)
+async def test_sorts_and_nested_filters_must_use_known_fields(client, change, unknown):
+    mock_lightdash()
+    query = CHART["metricQuery"] | change
+
+    with pytest.raises(ToolError, match=f"Unknown fields in orders: {unknown}\\."):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": query})
+
+
+def test_replacing_a_chart_keeps_its_table_and_pivot_configuration():
+    table_config = {"columnOrder": ["orders_order_date_week", "orders_revenue"]}
+    pivot_config = {"columns": ["orders_status"]}
+    existing = CHART | {
+        "description": "Weekly revenue",
+        "tableConfig": table_config,
+        "pivotConfig": pivot_config,
+        "chartConfig": {"type": "table", "config": {}},
+    }
+    given_table_config = {"columnOrder": ["orders_revenue"]}
+
+    kept = keep_existing("charts", CHART, existing)
+    replaced = keep_existing("charts", CHART | {"tableConfig": given_table_config}, existing)
+
+    assert (kept["tableConfig"], kept["pivotConfig"]) == (table_config, pivot_config)
+    assert kept["description"] == "Weekly revenue"
+    assert kept["chartConfig"] == CHART["chartConfig"]
+    assert replaced["tableConfig"] == given_table_config
+    assert keep_existing("charts", CHART, None) == CHART

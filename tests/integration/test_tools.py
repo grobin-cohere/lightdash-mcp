@@ -46,7 +46,7 @@ def scheduler(lightdash_admin: httpx.Client, project_uuid: str):
         f"/api/v1/saved/{chart['uuid']}/schedulers",
         json={
             "name": "mcp test delivery",
-            "message": "",
+            "message": "mcp test message",
             "format": "csv",
             "cron": "0 9 * * 1",
             "timezone": "UTC",
@@ -148,6 +148,8 @@ async def test_group_membership(admin, tool, editor_uuid):
     assert editor_uuid in members()
 
     assert ok(await tool(admin, "remove_group_member", args))["wouldRemove"]["email"] == EDITOR
+    groups = ok(await tool(admin, "list_groups"))
+    assert editor_uuid in members()
     ok(await tool(admin, "remove_group_member", {**args, "dry_run": False}))
     groups = ok(await tool(admin, "list_groups"))
     assert editor_uuid not in members()
@@ -159,6 +161,13 @@ async def test_scheduler_lifecycle(admin, tool, project_uuid, scheduler, lightda
 
     listed = find(ok(await tool(admin, "list_schedulers", {"project_uuid": project_uuid})))
     assert listed["recipients"] == ["demo@lightdash.com"]
+
+    rename = {"scheduler_uuid": scheduler, "name": "renamed"}
+    renamed = ok(await tool(admin, "update_scheduler", rename))
+    stored = lightdash_admin.get(f"/api/v1/schedulers/{scheduler}").json()["results"]
+    assert renamed["name"] == "renamed"
+    assert (renamed["cron"], renamed["timezone"]) == ("0 9 * * 1", "UTC")
+    assert (stored["timezone"], stored["message"]) == ("UTC", "mcp test message")
 
     updated = ok(await tool(admin, "update_scheduler", {"scheduler_uuid": scheduler, "name": "renamed", "cron": "0 7 * * 2"}))
     assert (updated["name"], updated["cron"], updated["recipients"]) == ("renamed", "0 7 * * 2", ["demo@lightdash.com"])
@@ -192,6 +201,7 @@ async def test_move_and_delete_content(admin, tool, project_uuid, space, lightda
     delete = {"project_uuid": project_uuid, "content_type": "space", "uuid": space}
     preview = ok(await tool(admin, "delete_content", delete))
     assert preview["wouldDelete"]["item"]["name"] == "mcp test space"
+    assert lightdash_admin.get(f"/api/v1/projects/{project_uuid}/spaces/{space}").status_code == 200
     ok(await tool(admin, "delete_content", {**delete, "dry_run": False}))
     spaces = ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
     assert space not in [s["spaceUuid"] for s in spaces]

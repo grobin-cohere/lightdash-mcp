@@ -6,12 +6,13 @@ import json
 import logging
 import time
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 import respx
-from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
+from mcp.types import CallToolResult
 from redis.asyncio.client import Pipeline
 from redis.asyncio.lock import Lock
 from redis.asyncio.retry import Retry
@@ -19,34 +20,28 @@ from redis.exceptions import ConnectionError
 
 from lightdash_mcp import server as server_module
 from lightdash_mcp.auth import store as store_module
-from lightdash_mcp.auth.audit import MAX_VALUE
-from lightdash_mcp.auth.provider import Code, Grant, _challenge
+from lightdash_mcp.auth.audit import MAX_ITEMS, MAX_VALUE, clip_arguments
+from lightdash_mcp.auth.provider import CLIENT_TTL, Access, Code, Grant, _challenge
 from lightdash_mcp.auth.store import Store, digest
 from lightdash_mcp.config import Settings
-from lightdash_mcp.server import asgi_app, audit, create_server
+from lightdash_mcp.server import (
+    BasicAuthClientId,
+    _basic_credentials,
+    asgi_app,
+    audit,
+    create_server,
+    transport_security,
+)
 
-LIGHTDASH = "http://lightdash.test"
-TOKEN_URL = f"{LIGHTDASH}/api/v1/oauth/token"
-REVOKE_URL = f"{LIGHTDASH}/api/v1/oauth/revoke"
-REDIRECT = "http://localhost:9999/callback"
+from .conftest import REDIRECT, REFRESHED, REVOKE_URL, TOKEN_URL, make_settings
+
 VERIFIER = "v" * 64
-REFRESHED = httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
 
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(
-        _env_file=None,
-        lightdash_url=LIGHTDASH,
-        lightdash_client_id="id",
-        lightdash_client_secret="lightdash-secret",
-        fernet_key=Fernet.generate_key().decode(),
-    )
-
-
-@pytest.fixture
-def redis() -> FakeAsyncRedis:
-    return FakeAsyncRedis()
+    # A secret of its own, so the audit log test can look for it.
+    return make_settings(lightdash_client_secret="lightdash-secret")
 
 
 @pytest.fixture
@@ -554,3 +549,208 @@ def test_redis_requests_time_out(settings, monkeypatch):
     assert isinstance(created["retry"], Retry) and created["retry"].get_retries() == 1  # the async Retry, not redis.retry's
     # The commands retry with the pool's connections' policy, not the client's.
     assert from_url(settings.redis_url, **created).connection_pool.make_connection().retry.get_retries() == 1
+
+
+def basic(credentials: bytes) -> str:
+    return "Basic " + base64.b64encode(credentials).decode()
+
+
+def code_form(code: str) -> dict:
+    return {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT,
+        "code_verifier": VERIFIER,
+    }
+
+
+@pytest.mark.parametrize(
+    ("authorization", "expected"),
+    [
+        ("Basic not-base64!", None),
+        (basic(b"\xff\xfe:secret"), None),
+        (basic(b"no-separator"), None),
+        (basic(b":secret"), None),
+        ("basic " + base64.b64encode(b"client:secret").decode(), None),
+        ("Bearer token", None),
+        (basic(b"client:secret"), ("client", "secret")),
+        (basic(b"my%20client:se%3Acret"), ("my client", "se:cret")),
+        (basic(b"client:sec:ret"), ("client", "sec:ret")),
+        (basic(b"client:"), ("client", "")),
+    ],
+)
+def test_basic_credentials_are_read_strictly(authorization, expected):
+    assert _basic_credentials(authorization) == expected
+
+
+async def test_a_garbage_basic_header_is_refused_without_a_server_error(http, settings, redis):
+    client = await register(http, "client_secret_basic")
+    code = await add_code(settings, redis, client)
+    form = code_form(code) | {"client_id": client["client_id"]}
+
+    garbage = ["Basic not-base64!", basic(b"\xff\xfe:x"), basic(b"no-separator"), "Basic "]
+
+    for authorization in garbage:
+        response = await http.post("/token", headers={"Authorization": authorization}, data=form)
+
+        assert response.status_code == 401, authorization
+        assert response.json()["error"] == "invalid_client"
+
+    # The refused requests didn't use the code up.
+    header = basic(f"{client['client_id']}:{client['client_secret']}".encode())
+    tokens = await http.post("/token", headers={"Authorization": header}, data=code_form(code))
+    assert tokens.status_code == 200, tokens.text
+
+
+async def test_only_the_credentials_missing_from_the_form_are_added():
+    body = b"grant_type=authorization_code&client_id=A"
+    received = {}
+
+    async def app(scope, receive, send):
+        message = await receive()
+        received["form"] = parse_qs(message["body"].decode())
+        received["length"] = dict(scope["headers"])[b"content-length"]
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    headers = [
+        (b"authorization", basic(b"B:secret-b").encode()),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    scope = {"type": "http", "method": "POST", "path": "/token", "headers": headers}
+    await BasicAuthClientId(app)(scope, receive, None)
+
+    assert received["form"] == {
+        "grant_type": ["authorization_code"],
+        "client_id": ["A"],
+        "client_secret": ["secret-b"],
+    }
+    assert received["length"] == str(len(body) + len(b"&client_secret=secret-b")).encode()
+
+
+async def test_a_basic_header_cannot_authenticate_another_form_client(http, settings, redis):
+    victim = await register(http)
+    attacker = await register(http)
+    code = await add_code(settings, redis, victim)
+    header = basic(f"{attacker['client_id']}:{attacker['client_secret']}".encode())
+
+    form = code_form(code) | {"client_id": victim["client_id"]}
+    response = await http.post("/token", headers={"Authorization": header}, data=form)
+
+    assert (response.status_code, response.json()["error"]) == (401, "invalid_client")
+    assert (await exchange(http, victim, code)).status_code == 200
+
+
+async def test_requests_to_mcp_need_an_allowed_host_and_origin(redis):
+    settings = make_settings(public_url="https://mcp.example.com")
+    store = Store(redis, settings.fernet_key)
+    token = "our-access"
+    grant = Grant(
+        client_id="client",
+        subject="user",
+        access_token="ld-access",
+        refresh_token="ld-refresh",
+        expires_at=time.time() + 3600,
+        access_digest=digest(token),
+    )
+    access = Access(token=token, client_id="client", scopes=[], subject="user", grant_id="grant")
+    await store.put("grant", "grant", grant)
+    await store.put("access", digest(token), access)
+    security = transport_security(settings)
+    app = create_server(settings, redis).streamable_http_app(transport_security=security)
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+    cases = [
+        ("evil.example", None, 421),
+        ("mcp.example.com", "https://evil.example", 403),
+        ("mcp.example.com", "http://mcp.example.com", 403),
+        ("mcp.example.com", "https://mcp.example.com", 200),
+        ("localhost:8000", "http://localhost:8000", 200),
+    ]
+
+    transport = httpx.ASGITransport(app)
+    http = httpx.AsyncClient(transport=transport, base_url="https://mcp.example.com")
+    async with app.router.lifespan_context(app), http:
+        for host, origin, status in cases:
+            sent = headers | {"Host": host} | ({"Origin": origin} if origin else {})
+            response = await http.post("/mcp", headers=sent, json=initialize)
+
+            assert response.status_code == status, (host, origin, response.text)
+
+
+async def test_a_code_exchange_keeps_the_client(http, settings, redis):
+    client = await register(http)
+    key = f"lightdash-mcp:client:{client['client_id']}"
+    await redis.expire(key, 60)
+
+    response = await exchange(http, client, await add_code(settings, redis, client))
+
+    assert response.status_code == 200, response.text
+    assert await redis.ttl(key) > CLIENT_TTL - 60
+
+
+def audit_lines(caplog) -> list[dict]:
+    return [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
+
+
+def tool_call() -> SimpleNamespace:
+    return SimpleNamespace(method="tools/call", params={"name": "list_projects", "arguments": {}})
+
+
+async def test_the_audit_log_marks_failed_calls(caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+
+    async def raising(_):
+        raise RuntimeError("boom")
+
+    async def error_dict(_):
+        return {"isError": True}
+
+    async def error_model(_):
+        return CallToolResult(content=[], is_error=True)
+
+    async def success_model(_):
+        return CallToolResult(content=[])
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await audit(tool_call(), raising)
+    assert await audit(tool_call(), error_dict) == {"isError": True}
+    assert (await audit(tool_call(), error_model)).is_error
+    await audit(tool_call(), success_model)
+
+    assert [line["error"] for line in audit_lines(caplog)] == [True, True, True, False]
+
+
+async def test_the_audit_log_leaves_out_other_requests(caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+
+    async def call_next(_):
+        return {"tools": []}
+
+    for ctx in (
+        SimpleNamespace(method="tools/list", params={"name": "list_projects"}),
+        SimpleNamespace(method="tools/call", params=None),
+    ):
+        assert await audit(ctx, call_next) == {"tools": []}
+
+    assert audit_lines(caplog) == []
+
+
+def test_logged_arguments_are_capped():
+    many = {f"argument{number}": number for number in range(MAX_ITEMS + 5)}
+    numbers = list(range(1000))
+
+    assert list(clip_arguments(many)) == list(many)[:MAX_ITEMS]
+    assert clip_arguments("x" * 1000) == "x" * MAX_VALUE + "..."
+    assert clip_arguments([1, 2]) == [1, 2]
+    assert clip_arguments(numbers) == json.dumps(numbers)[:MAX_VALUE] + "..."
