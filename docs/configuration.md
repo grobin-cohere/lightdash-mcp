@@ -77,10 +77,10 @@ uv run lightdash-mcp
 The image sets `HOST=0.0.0.0`: inside a container, the server must listen on every interface for a published port to reach it.
 
 ```bash
-docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
+docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.2
 ```
 
-Each release has its own image tag, such as `0.4.0`. `:latest` follows the newest one. Pin a version tag, so an upgrade happens only when you change it.
+Each release has its own image tag, such as `0.4.2`. `:latest` follows the newest one. Pin a version tag, so an upgrade happens only when you change it.
 
 Inside the container, `localhost` is the container itself. Point `REDIS_URL` at an address the container can reach, such as `redis://host.docker.internal:6379/0` for Redis on the host. `LIGHTDASH_URL` must be reachable from both the container and your browser, which signs in there.
 
@@ -89,7 +89,7 @@ With `network_mode: host`, the container shares the machine's interfaces, so `HO
 ```yaml
 services:
   lightdash-mcp:
-    image: ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
+    image: ghcr.io/grobin-cohere/lightdash-mcp:0.4.2
     network_mode: host
     env_file: .env
     environment:
