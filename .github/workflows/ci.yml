@@ -9,18 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # Every check of the Dagger module in .dagger: lint, unit tests, integration tests against a fresh
+  # Lightdash, and the image build. `make check` runs the same ones locally.
+  check:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.15"]
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
         with:
-          python-version: ${{ matrix.python }}
-      - run: uv sync --locked
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      # The integration tests skip themselves: they need the local Lightdash from make dev.
-      - run: uv run pytest
+          version: v0.21.11 # the engineVersion in dagger.json
+          verb: check
