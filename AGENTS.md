@@ -12,12 +12,13 @@ lightdash-mcp: an MCP server for self-hosted Lightdash (data queries, access, co
 | `make mcp` | Run the MCP server only |
 | `make test` | `uv run pytest` |
 | `make lint` | `ruff check .` and `ruff format --check .` (line length 130) |
+| `make check` | `dagger check`: CI's checks in containers, with their own Lightdash (needs Docker and the Dagger CLI) |
 | `make logs` / `make stop` / `make clean` | Follow logs / stop / delete containers, volumes, `.lightdash/` and the `.env` created by `make dev` |
 
 - Single test: `uv run pytest tests/unit/test_provider.py::test_name`
-- Unit tests use `respx` and `fakeredis`. Integration tests (`tests/integration`) need the local Lightdash from `make dev`, start the server on port 8765, use Redis db 15, and skip themselves when Lightdash is down. They modify the demo data: run `make clean` and `make dev` after an interrupted run.
-- CI runs `uv sync --locked`, ruff and pytest on Python 3.15.
-- `Dockerfile` builds the server image (uv build stage, slim runtime as `nobody`, `HOST=0.0.0.0`). `.github/workflows/docker.yml` pushes it to `ghcr.io/grobin-cohere/lightdash-mcp` (tags: `pyproject.toml` version and `latest`, amd64 and arm64) on each published release, or by hand from `main`, after the tests pass, and never over an existing version tag. Actions and base images are pinned by SHA and digest.
+- Unit tests use `respx` and `fakeredis`. Integration tests (`tests/integration`) need the local Lightdash from `make dev` (or `make check`'s own), start the server on port 8765, use Redis db 15, and skip themselves when Lightdash is down. They modify the demo data: run `make clean` and `make dev` after an interrupted run.
+- CI is the Dagger module in `.dagger/` (Python, Dagger 0.21, `dagger.json` at the root). `dagger check` runs `ci:lint`, `ci:unit-tests`, `ci:integration-tests` (a fresh Lightdash, MinIO and Redis as Dagger services; with `INTEGRATION_LIGHTDASH_URL` set, the tests fail instead of skipping when Lightdash doesn't start) and `ci:image` (builds the `Dockerfile`, no push), with Python and uv from the `Dockerfile`'s build image. `.github/workflows/ci.yml` runs it on each PR and push to `main`. Its Lightdash version and image digests in `.dagger/src/ci/main.py` follow the Makefile and `dev/lightdash.compose.yml`; Dependabot doesn't update them. Details in `docs/development.md`.
+- `Dockerfile` builds the server image (uv build stage, slim runtime as `nobody`, `HOST=0.0.0.0`). `.github/workflows/docker.yml` pushes it to `ghcr.io/grobin-cohere/lightdash-mcp` (tags: `pyproject.toml` version and `latest`, amd64 and arm64) on each published release, or by hand from `main`, after `dagger check` passes, and never over an existing version tag. Actions and base images are pinned by SHA and digest.
 - `.github/dependabot.yml` opens weekly update PRs for `uv.lock`, the GitHub Actions and the base images, a week after each release. Security updates come as soon as an alert opens.
 - Not published to PyPI: the `lightdash-mcp` name there belongs to another project. The Docker image is the release.
 - Run `make lint` and `make test` before a PR, and update `docs/` in the same change as the code.
