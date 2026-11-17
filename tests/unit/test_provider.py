@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -12,7 +13,7 @@ from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AuthorizationParams, TokenError
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.shared.auth import OAuthClientInformationFull
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from redis.asyncio.lock import Lock
 from redis.exceptions import LockNotOwnedError
 from starlette.requests import Request
@@ -29,14 +30,16 @@ from lightdash_mcp.auth.provider import (
     LightdashOAuthProvider,
     Refresh,
     RefreshFailed,
+    Rotated,
     SignInRequired,
     Transaction,
     _consent_cookie,
 )
 from lightdash_mcp.auth.store import Store, digest
-from lightdash_mcp.tools.common import BUSY, RECONNECT, lightdash
+from lightdash_mcp.tools.common import BUSY, RECONNECT, UNREACHABLE, lightdash
 
 from .conftest import LIGHTDASH, REDIRECT, REFRESHED, REVOKE_URL, TOKEN_URL, token_response
+from .test_server import add_code
 
 CLIENT = OAuthClientInformationFull(client_id="client", redirect_uris=[REDIRECT])
 
@@ -678,3 +681,167 @@ async def test_issued_access_tokens_follow_the_configured_lifetime(provider):
     access = await provider.load_access_token(issued.access_token)
     assert access.expires_at - time.time() > 23 * 60 * 60
     assert await provider.store._redis.ttl(f"lightdash-mcp:access:{digest(issued.access_token)}") > 23 * 60 * 60
+
+
+async def test_a_code_is_valid_only_while_its_grant_points_to_it(provider):
+    code = await add_code(provider.settings, provider.store._redis, {"client_id": "client"})
+    assert await provider.load_authorization_code(CLIENT, code)
+
+    grant = await provider.store.get("grant", "grant", Grant)
+    replaced = grant.model_copy(update={"code_digest": digest("another")})
+    await provider.store.put("grant", "grant", replaced)
+    assert await provider.load_authorization_code(CLIENT, code) is None
+
+    await provider.store.delete("grant", "grant")
+    assert await provider.load_authorization_code(CLIENT, code) is None
+
+
+async def test_a_code_exchange_fails_once_its_sign_in_ended(provider):
+    redis = provider.store._redis
+    replaced = await add_code(provider.settings, redis, {"client_id": "client"}, "replaced")
+    ended = await add_code(provider.settings, redis, {"client_id": "client"}, "ended")
+    codes = [
+        await provider.load_authorization_code(CLIENT, replaced),
+        await provider.load_authorization_code(CLIENT, ended),
+    ]
+
+    grant = await provider.store.get("grant", "replaced", Grant)
+    other = grant.model_copy(update={"code_digest": digest("another")})
+    await provider.store.put("grant", "replaced", other)
+    await provider.end_grant("ended", "test")
+
+    for code in codes:
+        with pytest.raises(TokenError) as error:
+            await provider.exchange_authorization_code(CLIENT, code)
+        assert error.value.error == "invalid_grant"
+        assert error.value.error_description == "Sign-in ended"
+
+
+@respx.mock
+async def test_a_refresh_token_exchanged_twice_at_once_works_once(provider):
+    await add_grant(provider, 3600)
+    refresh = await refresh_of(provider)
+    route = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    results = await asyncio.gather(
+        provider.exchange_refresh_token(CLIENT, refresh, []),
+        provider.exchange_refresh_token(CLIENT, refresh, []),
+        return_exceptions=True,
+    )
+
+    [issued] = [result for result in results if isinstance(result, OAuthToken)]
+    [refused] = [result for result in results if isinstance(result, TokenError)]
+    assert refused.error == "invalid_grant"
+    assert route.call_count == 1
+    assert await provider.load_access_token(issued.access_token)
+    assert await provider.load_refresh_token(CLIENT, issued.refresh_token)
+
+
+async def expire_grant(provider: LightdashOAuthProvider) -> None:
+    """Puts the grant past its lifetime while Redis still holds it, as its TTL's rounding can."""
+    grant = await provider.store.get("grant", "grant", Grant)
+    expired = grant.model_copy(update={"created_at": time.time() - GRANT_LIFETIME - 10})
+
+    await provider.store.put("grant", "grant", expired)
+
+
+@respx.mock
+async def test_a_sign_in_past_its_lifetime_gets_no_new_tokens(provider):
+    await add_grant(provider, 3600)
+    refresh = await refresh_of(provider)
+    await expire_grant(provider)
+    lightdash_refresh = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    with pytest.raises(TokenError) as error:
+        await provider.exchange_refresh_token(CLIENT, refresh, [])
+
+    assert error.value.error == "invalid_grant"
+    assert not lightdash_refresh.called
+    assert await provider.store.get("grant", "grant", Grant) is None
+
+
+@respx.mock
+async def test_tools_past_the_sign_in_lifetime_ask_to_reconnect(provider):
+    await add_grant(provider, 10)
+    await expire_grant(provider)
+    lightdash_refresh = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    with pytest.raises(SignInRequired):
+        await provider.lightdash_token("grant")
+
+    assert not lightdash_refresh.called
+    assert await provider.store.get("grant", "grant", Grant) is None
+
+
+async def test_an_expired_access_token_is_refused_while_redis_still_holds_it(provider):
+    access = await add_grant(provider, 3600)
+    stored = await provider.store.get("access", digest(access), Access)
+    expired = stored.model_copy(update={"expires_at": int(time.time()) - 10})
+
+    await provider.store.put("access", digest(access), expired)
+
+    assert await provider.store.get("access", digest(access), Access)
+    assert await provider.load_access_token(access) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(400, text="<html>Bad request</html>"),
+        httpx.Response(400, json=[{"error": "invalid_grant"}]),
+        httpx.Response(500, json={"error": "invalid_grant"}),
+    ],
+)
+@respx.mock
+async def test_refresh_errors_other_than_a_refused_grant_keep_the_sign_in(provider, answer):
+    access = await add_grant(provider, 10)
+    respx.post(TOKEN_URL).mock(return_value=answer)
+
+    with pytest.raises(RefreshFailed):
+        await provider.lightdash_token("grant")
+
+    assert await provider.store.get("grant", "grant", Grant)
+    assert await provider.load_access_token(access)
+
+
+@respx.mock
+async def test_an_unreachable_upstream_revocation_is_logged(provider, caplog):
+    access = await add_grant(provider, 3600)
+    respx.post(REVOKE_URL).mock(side_effect=httpx.ConnectError("down"))
+
+    await provider.revoke_token(await provider.load_access_token(access))
+
+    assert await provider.store.get("grant", "grant", Grant) is None
+    assert '"event": "lightdash_revoke_failed"' in caplog.text
+    assert '"failure": "ConnectError"' in caplog.text
+
+
+@pytest.mark.parametrize("ttl", [0, -5])
+async def test_a_ttl_already_past_keeps_the_value_for_one_second(provider, ttl):
+    value = Rotated(client_id="client", grant_id="grant")
+    redis = provider.store._redis
+
+    await provider.store.put("rotated", "put", value, ttl)
+    await provider.store.write(put=[("rotated", "written", value, ttl)])
+
+    assert await redis.ttl("lightdash-mcp:rotated:put") == 1
+    assert await redis.ttl("lightdash-mcp:rotated:written") == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        (httpx.Response(404, json={"error": {"message": "No such org"}}), "Not found: No such org"),
+        (httpx.Response(500, json={"error": {"message": "Boom"}}), "Lightdash error 500: Boom"),
+        (httpx.ConnectError("down"), UNREACHABLE),
+    ],
+)
+@respx.mock
+async def test_tools_map_other_lightdash_failures(provider, answer, message):
+    access = await add_grant(provider, 3600)
+    respx.get(f"{LIGHTDASH}/api/v1/org").mock(side_effect=[answer])
+
+    async with signed_in(provider, access):
+        with pytest.raises(ToolError, match=re.escape(message)):
+            async with lightdash(provider) as ld:
+                await ld.get("/api/v1/org")

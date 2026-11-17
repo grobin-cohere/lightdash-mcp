@@ -132,6 +132,8 @@ async def test_charts_can_use_hidden_fields(client):
         ({"sorts": [{"descending": True}]}, "Each of metricQuery.sorts needs fieldId"),
         ({"additionalMetrics": [{"name": "x"}]}, "Each of metricQuery.additionalMetrics needs table and name"),
         ({"dimensions": [{"fieldId": "orders_status"}]}, "metricQuery.dimensions must be a list of field IDs"),
+        ({"customDimensions": [{"name": "g"}]}, "Each of metricQuery.customDimensions needs id"),
+        ({"customDimensions": {"id": "g"}}, "Each of metricQuery.customDimensions needs id"),
     ],
 )
 async def test_malformed_charts_are_refused_with_a_reason(client, change, error):
@@ -412,10 +414,6 @@ async def test_dashboard_tiles_are_checked_and_unsaved_charts_listed(client):
         await check_dashboard(client, PROJECT, {"tiles": [tile | {"properties": {}}]})
     with pytest.raises(ToolError, match="Tile 0 needs w, h"):
         await check_dashboard(client, PROJECT, {"tiles": [markdown]})
-    with pytest.raises(ToolError, match="Tile 0 properties must be an object"):
-        await check_dashboard(client, PROJECT, {"tiles": [tile | {"properties": "revenue-per-week"}]})
-    with pytest.raises(ToolError, match="tiles must be a list"):
-        await check_dashboard(client, PROJECT, {"tiles": {"0": tile}})
 
 
 async def test_slugs_cannot_reach_other_endpoints(settings):
@@ -476,3 +474,94 @@ async def test_charts_can_be_given_by_slug_within_the_project(client):
     assert await resolve_chart(client, PROJECT, "revenue-per-week") == CHART_UUID
     with pytest.raises(ToolError, match="No chart with slug other-project-chart in this project"):
         await resolve_chart(client, PROJECT, "other-project-chart")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("tiles", "error"),
+    [
+        ({"type": "markdown"}, "tiles must be a list"),
+        (["markdown"], "Tile 0 needs type, x, y, w, h, properties"),
+        (
+            [{"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": "Hi"}],
+            "Tile 0 properties must be an object",
+        ),
+    ],
+)
+async def test_malformed_dashboard_tiles_are_refused_with_a_reason(client, tiles, error):
+    with pytest.raises(ToolError, match=error):
+        await check_dashboard(client, PROJECT, {"tiles": tiles})
+
+
+@respx.mock
+async def test_dashboards_without_chart_tiles_do_not_look_up_charts(client):
+    charts = respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/code/charts").mock(
+        return_value=httpx.Response(200, json={"results": {"charts": [], "missingIds": []}}),
+    )
+    markdown = {"type": "markdown", "x": 0, "y": 0, "w": 36, "h": 4, "properties": {}}
+
+    missing = await check_dashboard(client, PROJECT, {"tiles": [markdown]})
+
+    assert missing == []
+    assert not charts.called
+
+
+@respx.mock
+async def test_custom_dimensions_and_additional_metrics_count_as_fields(client):
+    mock_lightdash()
+    query = CHART["metricQuery"] | {
+        "dimensions": ["orders_order_date_week", "status_group"],
+        "metrics": ["orders_revenue", "orders_margin"],
+        "customDimensions": [{"id": "status_group", "name": "Status group"}],
+        "additionalMetrics": [{"table": "orders", "name": "margin"}],
+        "sorts": [{"fieldId": "orders_margin", "descending": True}],
+    }
+
+    await check_chart(client, PROJECT, CHART | {"metricQuery": query})
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("change", "unknown"),
+    [
+        ({"sorts": [{"fieldId": "orders_rank", "descending": False}]}, "orders_rank"),
+        (
+            {
+                "filters": {
+                    "dimensions": {
+                        "id": "outer",
+                        "or": [{"id": "inner", "and": [{"target": {"fieldId": "orders_deep"}}]}],
+                    }
+                }
+            },
+            "orders_deep",
+        ),
+    ],
+)
+async def test_sorts_and_nested_filters_must_use_known_fields(client, change, unknown):
+    mock_lightdash()
+    query = CHART["metricQuery"] | change
+
+    with pytest.raises(ToolError, match=f"Unknown fields in orders: {unknown}\\."):
+        await check_chart(client, PROJECT, CHART | {"metricQuery": query})
+
+
+def test_replacing_a_chart_keeps_its_table_and_pivot_configuration():
+    table_config = {"columnOrder": ["orders_order_date_week", "orders_revenue"]}
+    pivot_config = {"columns": ["orders_status"]}
+    existing = CHART | {
+        "description": "Weekly revenue",
+        "tableConfig": table_config,
+        "pivotConfig": pivot_config,
+        "chartConfig": {"type": "table", "config": {}},
+    }
+    given_table_config = {"columnOrder": ["orders_revenue"]}
+
+    kept = keep_existing("charts", CHART, existing)
+    replaced = keep_existing("charts", CHART | {"tableConfig": given_table_config}, existing)
+
+    assert (kept["tableConfig"], kept["pivotConfig"]) == (table_config, pivot_config)
+    assert kept["description"] == "Weekly revenue"
+    assert kept["chartConfig"] == CHART["chartConfig"]
+    assert replaced["tableConfig"] == given_table_config
+    assert keep_existing("charts", CHART, None) == CHART

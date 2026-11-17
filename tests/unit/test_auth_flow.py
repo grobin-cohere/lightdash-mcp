@@ -9,9 +9,16 @@ from mcp.server.auth.provider import AuthorizationParams, AuthorizeError, Regist
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 
-from lightdash_mcp.auth.provider import LightdashOAuthProvider, Transaction, _consent_cookie
+from lightdash_mcp.auth.provider import (
+    MAX_STATE,
+    LightdashOAuthProvider,
+    Transaction,
+    _consent_cookie,
+)
 
-from .conftest import LIGHTDASH, REDIRECT, TOKEN_URL
+from .conftest import LIGHTDASH, REDIRECT, TOKEN_URL, token_response
+
+USER_URL = f"{LIGHTDASH}/api/v1/user"
 
 
 def request(path: str, query: dict | None = None, cookies: dict | None = None, form: dict | None = None) -> Request:
@@ -223,3 +230,115 @@ async def test_a_failed_lightdash_sign_in_returns_to_the_client(provider):
         request("/oauth/lightdash/callback", {"state": transaction_id, "code": "c"}, {_consent_cookie(transaction_id): csrf})
     )
     assert parse_qs(urlparse(response.headers["location"]).query)["error"] == ["server_error"]
+
+
+async def approve(provider: LightdashOAuthProvider, transaction_id: str) -> None:
+    transaction = await provider.store.get("transaction", transaction_id, Transaction)
+    approved = transaction.model_copy(update={"approved": True})
+    await provider.store.put("transaction", transaction_id, approved)
+
+
+async def test_the_consent_page_escapes_the_client_name_and_cannot_be_framed(provider):
+    await provider.register_client(client(client_name='<script>x</script>"'))
+    location = await provider.authorize(client(), params())
+    transaction_id = parse_qs(urlparse(location).query)["transaction"][0]
+
+    page = await provider.consent_page(request("/oauth/consent", {"transaction": transaction_id}))
+
+    body = page.body.decode()
+    assert "<script>x</script>" not in body
+    assert "&lt;script&gt;x&lt;/script&gt;&quot;" in body
+    assert page.headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert page.headers["cache-control"] == "no-store"
+    cookie = page.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "samesite=lax" in cookie
+    assert "path=/oauth" in cookie
+
+
+async def test_a_denied_consent_returns_to_the_client(provider):
+    transaction_id, csrf = await start(provider)
+    cookie = _consent_cookie(transaction_id)
+    form = {"transaction": transaction_id, "csrf": csrf, "action": "deny"}
+    denied = request("/oauth/consent", cookies={cookie: csrf}, form=form)
+
+    response = await provider.consent_submit(denied)
+
+    assert response.status_code == 302
+    location = urlparse(response.headers["location"])
+    assert f"{location.scheme}://{location.netloc}{location.path}" == REDIRECT
+    assert parse_qs(location.query) == {"error": ["access_denied"], "state": ["client-state"]}
+    assert await provider.store.get("transaction", transaction_id, Transaction) is None
+    deleted = response.headers["set-cookie"].lower()
+    assert deleted.startswith(f'{cookie}="";')
+    assert "max-age=0" in deleted
+    assert "path=/oauth" in deleted
+
+
+async def test_the_consent_page_expires_with_its_client(provider):
+    transaction_id, _ = await start(provider)
+    await provider.store.delete("client", "client")
+
+    page = await provider.consent_page(request("/oauth/consent", {"transaction": transaction_id}))
+
+    assert page.status_code == 400
+    assert "Sign-in expired" in page.body.decode()
+    assert "set-cookie" not in page.headers
+
+
+@respx.mock
+async def test_a_callback_works_once(provider):
+    transaction_id, csrf = await start(provider)
+    cookies = {_consent_cookie(transaction_id): csrf}
+    form = {"transaction": transaction_id, "csrf": csrf, "action": "allow"}
+    await provider.consent_submit(request("/oauth/consent", cookies=cookies, form=form))
+    respx.post(TOKEN_URL).mock(return_value=token_response())
+    user = httpx.Response(200, json={"results": {"userUuid": "user"}})
+    respx.get(USER_URL).mock(return_value=user)
+    callback = "/oauth/lightdash/callback"
+    query = {"state": transaction_id, "code": "lightdash-code"}
+
+    first = await provider.lightdash_callback(request(callback, query, cookies))
+    replayed = await provider.lightdash_callback(request(callback, query, cookies))
+
+    assert first.status_code == 302
+    assert "code" in parse_qs(urlparse(first.headers["location"]).query)
+    assert replayed.status_code == 400
+    assert "Sign-in expired" in replayed.body.decode()
+    assert len(await provider.store._redis.keys("lightdash-mcp:grant:*")) == 1
+
+
+@pytest.mark.parametrize(
+    "user",
+    [
+        httpx.Response(500),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"results": {}}),
+        httpx.Response(200, json=[]),
+    ],
+)
+@respx.mock
+async def test_a_sign_in_without_a_lightdash_user_returns_to_the_client(provider, user):
+    transaction_id, csrf = await start(provider)
+    await approve(provider, transaction_id)
+    respx.post(TOKEN_URL).mock(return_value=token_response())
+    respx.get(USER_URL).mock(return_value=user)
+    query = {"state": transaction_id, "code": "lightdash-code"}
+    cookies = {_consent_cookie(transaction_id): csrf}
+    callback = request("/oauth/lightdash/callback", query, cookies)
+
+    response = await provider.lightdash_callback(callback)
+
+    assert response.status_code == 302
+    assert parse_qs(urlparse(response.headers["location"]).query)["error"] == ["server_error"]
+    assert not await provider.store._redis.keys("lightdash-mcp:grant:*")
+
+
+async def test_authorize_refuses_an_oversized_resource(provider):
+    resource = "https://mcp.example.com/" + "x" * MAX_STATE
+
+    with pytest.raises(AuthorizeError) as error:
+        await provider.authorize(client(), params(resource=resource))
+
+    assert error.value.error == "invalid_request"
+    assert not await provider.store._redis.keys("lightdash-mcp:transaction:*")

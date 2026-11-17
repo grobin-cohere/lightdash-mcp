@@ -143,3 +143,65 @@ def test_redirect_hosts_are_a_comma_separated_list(monkeypatch):
     assert Settings(_env_file=None).redirect_hosts == []
     monkeypatch.setenv("REDIRECT_HOSTS", "dex.example.com, Claude.AI,")
     assert Settings(_env_file=None).redirect_hosts == ["dex.example.com", "claude.ai"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        (httpx.Response(500, json={"error": {"name": "InternalError"}}), "InternalError"),
+        (httpx.Response(502, json={"error": {}}), "Bad Gateway"),
+        (httpx.Response(503), "Service Unavailable"),
+        (httpx.Response(500, text="x" * 1000), "x" * 300),
+        (httpx.Response(400, json={"error": "Bad request"}), "Bad request"),
+        (httpx.Response(400, json={"error": "y" * 1000}), "y" * 300),
+        (httpx.Response(400, json=["first", "second"]), "['first', 'second']"),
+    ],
+)
+@respx.mock
+async def test_client_errors_read_whatever_lightdash_sends(client, answer, message):
+    respx.get(f"{LIGHTDASH}/api/v1/org").mock(return_value=answer)
+
+    with pytest.raises(LightdashError) as error:
+        await client.get("/api/v1/org")
+
+    assert (error.value.status, error.value.message) == (answer.status_code, message)
+
+
+@respx.mock
+async def test_client_without_a_refresh_does_not_retry_a_401(client):
+    refused = httpx.Response(401, json={"error": {"message": "Expired"}})
+    route = respx.get(f"{LIGHTDASH}/api/v1/org").mock(return_value=refused)
+
+    with pytest.raises(LightdashError) as error:
+        await client.get("/api/v1/org")
+
+    assert (error.value.status, error.value.message) == (401, "Expired")
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "https://mcp.example.com?next=1",
+        "https://mcp.example.com#top",
+        "https://mcp.example.com/mcp/",
+        "http://:8000",
+        "http://",
+    ],
+)
+def test_public_url_must_be_the_root_of_a_host(public_url):
+    with pytest.raises(SystemExit, match="PUBLIC_URL"):
+        make_settings(public_url=public_url).check()
+
+
+def test_settings_accept_ipv6_loopback_and_strip_trailing_slashes():
+    make_settings(public_url="http://[::1]:8000").check()
+
+    assert make_settings(lightdash_url=f"{LIGHTDASH}/").lightdash_url == LIGHTDASH
+
+
+def test_access_token_lifetime_is_at_least_a_minute():
+    assert make_settings(access_token_ttl=60).access_token_ttl == 60
+
+    with pytest.raises(ValueError):
+        make_settings(access_token_ttl=59)
