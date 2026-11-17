@@ -14,6 +14,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 | `auth/store.py` | Encrypted Redis storage, atomic writes and locks |
 | `lightdash.py` | The async Lightdash API client and its errors. Every user's client shares the provider's HTTP client and its connections. That client keeps no cookies, so one user's cookie never goes out with another's request |
 | `tools/common.py` | A Lightdash client for the signed-in user, error mapping, tool annotations |
+| `tools/shared.py` | Helpers the tools modules share: paginated lists, argument pattern checks, space slugs |
 | `tools/access.py` | Users, groups, roles, project and space access |
 | `tools/content.py` | Finding charts and dashboards, reading dashboards, unused content, validation errors, moving and deleting content |
 | `tools/code.py` | Charts and dashboards as code: reading them, checking them, creating and replacing them |
@@ -23,12 +24,21 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 ## Sign-in
 
 1. The MCP client registers itself (`/register`) and opens `/authorize`.
-2. The server saves the request for 10 minutes and shows its consent page (`/oauth/consent`), which names the client and shows the whole address it returns to, with a warning when that address is a website (not a loopback address, and not on a host of `REDIRECT_HOSTS`) or an app. One Lightdash OAuth client serves every MCP client, so Lightdash's own consent page can't tell them apart. The form is protected by a CSRF token in a `SameSite=Lax` cookie, one per sign-in, made once in `/authorize` so a prefetch or a second tab doesn't change it, marked `Secure` when `PUBLIC_URL` is HTTPS, and the page can't be framed.
-3. On **Allow**, the server redirects to Lightdash's `/authorize` with its own PKCE and the saved request's id as `state`.
-4. Lightdash signs the user in and returns to `/oauth/lightdash/callback`. The callback only goes on in the browser that approved the consent page, checked with the same cookie (once approved, the consent page no longer opens, so no other browser can get a new one), so a Lightdash link taken from someone else's consent can't send this user's sign-in to another client. The server exchanges the code, reads the user from `/api/v1/user`, creates a grant, and returns its own single-use code to the client. If Lightdash fails, the client gets `error=server_error`. Of Lightdash's own errors, only `access_denied` and `temporarily_unavailable` reach the client; any other is `server_error`.
+2. The server saves the request for 10 minutes and shows its consent page (`/oauth/consent`). One Lightdash OAuth client serves every MCP client, so Lightdash's own consent page can't tell them apart. The consent page works like this:
+   - It names the client and shows the whole address it returns to.
+   - It warns when that address is an app, or a website: not a loopback address, and not on a host of `REDIRECT_HOSTS`.
+   - A CSRF token in a `SameSite=Lax` cookie protects the form. There is one per sign-in. `/authorize` makes it once, so a prefetch or a second tab doesn't change it. The cookie is `Secure` when `PUBLIC_URL` is HTTPS.
+   - The page can't be framed.
+3. On **Continue to Lightdash**, the server redirects to Lightdash's `/authorize` with its own PKCE and the saved request's id as `state`. On **Cancel**, the client gets `error=access_denied`.
+4. Lightdash signs the user in and returns to `/oauth/lightdash/callback`.
+   - The callback goes on only in the browser that approved the consent page. The same cookie proves it.
+   - Once approved, the consent page no longer opens, so no other browser can get a new cookie.
+   - So a Lightdash link taken from someone else's consent can't send this user's sign-in to another client.
+   - The server exchanges the code, reads the user from `/api/v1/user`, creates a grant, and returns its own single-use code to the client.
+   - If Lightdash fails, the client gets `error=server_error`. Of Lightdash's own errors, only `access_denied` and `temporarily_unavailable` reach the client. Any other becomes `server_error`.
 5. The client exchanges that code, with its PKCE verifier, for the server's tokens.
 
-A client registered with `client_secret_basic` may send its credentials only in the `Authorization` header, as RFC 6749 section 2.3.1 allows; Dex does, so North's MCP connectors do. The MCP SDK's token and revocation endpoints also require them in the form body, so `BasicAuthClientId` copies them there from the header, for `/token` and `/revoke`. The SDK still checks the secret. It reads at most 64 KiB of body (413 above), as the consent form does.
+A client registered with `client_secret_basic` can send its credentials only in the `Authorization` header, as RFC 6749 section 2.3.1 allows. Dex does this, so North's MCP connectors do too. The MCP SDK's token and revocation endpoints also require the credentials in the form body. So `BasicAuthClientId` copies them there from the header, for `/token` and `/revoke`. The SDK still checks the secret. `BasicAuthClientId` reads at most 64 KiB of body and answers 413 above that, as the consent form does.
 
 ### What registration accepts
 
@@ -42,17 +52,29 @@ Registration is open, as MCP clients need, so it checks what it stores:
 
 - A grant is one sign-in. It holds the user's Lightdash access and refresh tokens, and the digests of this server's current code and tokens for it.
 - The client gets the server's own tokens: an access token for 1 hour (`ACCESS_TOKEN_TTL`) and a refresh token for 14 days. Both point to the grant, and are valid only while the grant points back to them. Lightdash tokens never leave the server.
-- A grant lasts at most 90 days (`GRANT_LIFETIME`), however often its client refreshes: then the user signs in again.
+- A grant lasts at most 90 days, however often its client refreshes: then the user signs in again. The 90 days are a fixed constant in the code (`GRANT_LIFETIME` in `auth/provider.py`), not a setting.
 - Refreshing the client's tokens also refreshes the Lightdash ones, so both sign-ins last as long. A tool call refreshes the Lightdash token when it expires within a minute.
-- Refreshes run under a Redis lock per grant, and the new Lightdash tokens are saved before they are used, so a Lightdash refresh token is never used twice. Requests that Lightdash refused with the same token refresh it once: the others get the new one. A refresh gives up after 20 seconds, before the 30-second lock expires.
+- Refreshes run under a Redis lock per grant, `lightdash-mcp:lock:grant:<id>`. The lock expires after 30 seconds, and a request waits at most 30 seconds to get it. The new Lightdash tokens are saved before they are used, so a Lightdash refresh token is never used twice.
+- Requests that Lightdash refused with the same token refresh it once: the others get the new one. A refresh gives up after 20 seconds, before the lock expires.
 - A client's refresh holds the grant's lock from start to end. Its new access token, refresh token and grant are written in one Redis transaction (`MULTI`), and only then is the old refresh token gone: a failure, a crash or a cancellation before that leaves the old tokens working.
 - A refresh token works once. Its digest is kept for 14 days after its exchange: presented again by its client, it was copied, and the grant ends, here and on Lightdash. A second refresh still in flight with the same token is only refused.
 - When Lightdash refuses a refresh with `invalid_grant`, the grant ends and the user signs in again. Any other error, such as `invalid_client` from a wrong client secret, a malformed answer, or Lightdash being unreachable, keeps the grant and the client's refresh token so it can retry.
-- Revoking a token ends the grant here and revokes its refresh token on Lightdash, with this server's Lightdash client credentials. A refusal or a failure there is logged. It waits for a refresh in flight on the same grant, so the refresh can't bring the grant back or issue tokens after it.
+- Revoking a token ends the grant here and revokes its refresh token on Lightdash, with this server's Lightdash client credentials. A refusal or a failure there is logged. The revocation waits for a refresh in flight on the same grant, so the refresh can't bring the grant back or issue tokens after it.
 
 ## Storage
 
-Redis keys are `lightdash-mcp:{client,transaction,code,access,refresh,rotated,grant}:<id>`. Token keys are sha256 digests of the tokens. Every value is encrypted with `FERNET_KEY`, together with its own key, so a value copied under another key in Redis doesn't load. A value that doesn't decrypt, names another key, or no longer parses counts as missing: the client signs in again. Everything expires: client registrations 30 days after their last token exchange, sign-in requests in 10 minutes, codes in 5, tokens and grants with their lifetimes. A grant lasts 10 minutes until its client exchanges the code, so an unfinished sign-in doesn't keep the Lightdash tokens.
+Redis keys are `lightdash-mcp:{client,transaction,code,access,refresh,rotated,grant}:<id>`, and the grant locks are `lightdash-mcp:lock:grant:<id>`. Token keys are sha256 digests of the tokens.
+
+Every value is encrypted with `FERNET_KEY`, together with its own key, so a value copied under another key in Redis doesn't load. A value that doesn't decrypt, names another key, or no longer parses counts as missing: the client signs in again.
+
+Everything expires:
+
+- Client registrations: 30 days after their last token exchange.
+- Sign-in requests: 10 minutes.
+- Codes: 5 minutes.
+- Tokens and grants: with their lifetimes.
+- A grant whose client hasn't exchanged the code yet: 10 minutes, so an unfinished sign-in doesn't keep the Lightdash tokens.
+- Grant locks: 30 seconds.
 
 ## Errors
 
@@ -74,7 +96,7 @@ The `lightdash_mcp.audit` logger writes one JSON object per line, so a value sen
 | --- | --- | --- |
 | `tool_call` | Every tool call, at INFO | `user` (Lightdash UUID), `tool`, `arguments`, `error`. A value longer than 200 characters once serialized is cut, and at most 30 arguments are logged |
 | `client_registered` | A client registers | `client_id`, `client_name`, `redirect_uris` |
-| `consent` | The user clicks Continue or Cancel | `client_id`, `decision` |
+| `consent` | The user clicks Continue to Lightdash or Cancel | `client_id`, `decision`: `allow` or `deny` |
 | `grant_created` | A Lightdash sign-in finishes | `grant`, `subject`, `client_id` |
 | `sign_in_failed` | Lightdash's code exchange or user lookup fails, at WARNING | `client_id` |
 | `refresh_failed` | A Lightdash refresh fails but keeps the grant, at WARNING | `grant`, `subject`, `client_id`, `reason` |
@@ -101,7 +123,7 @@ Checked on Lightdash 3.93.6, open source, without a license:
 - **Flow:** authorization code with S256 PKCE works without `resource`. The token is then for the REST API, which accepts it as `Authorization: Bearer`. Permissions follow the user.
 - **Consent page:** Lightdash shows its own consent page on every sign-in. Its redirect back is an HTML page with a meta refresh, not a 302. In strict security mode the callback also gets an `iss` parameter.
 - **Lifetimes:** access token 1 hour, refresh token 14 days (`AUTH_OAUTH_SERVER_ACCESS_TOKEN_LIFETIME`, `AUTH_OAUTH_SERVER_REFRESH_TOKEN_LIFETIME`).
-- **Revocation:** `/revoke` takes the token alone; on 3.148.1 it ignores client credentials, which the server sends anyway, as RFC 7009 asks of a confidential client.
+- **Revocation:** `/revoke` takes the token alone and ignores client credentials. The server sends them anyway, as RFC 7009 asks of a confidential client. Its handler in Lightdash's source (`packages/backend/src/routers/oauthRouter.ts`) is the same at 3.93.6 and 3.148.1.
 - **Rotation:** each refresh returns a new refresh token. The old one stays usable for 60 seconds (`AUTH_OAUTH_SERVER_REFRESH_TOKEN_ROTATION_GRACE`), then gets `invalid_grant`. Reuse doesn't revoke the newest tokens.
 - **Introspection:** `/introspect` needs a Lightdash session, not client credentials. The server doesn't need it: it keeps the Lightdash tokens itself.
 - **Scopes:** `read` and `write` are only enforced behind the `AgentIdentity` and `OAuthScopeEnforcement` feature flags, off by default. A token can do whatever the user's role allows.
