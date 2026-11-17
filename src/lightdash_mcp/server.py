@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lightdash_mcp.auth.audit import clip, clip_arguments, record
-from lightdash_mcp.auth.provider import BUSY, FORM_LIMIT, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
+from lightdash_mcp.auth.provider import FORM_LIMIT, GRANT_BUSY, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
 from lightdash_mcp.auth.store import Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
@@ -189,13 +189,12 @@ def _try_again(path: str, error: RedisError) -> Response:
     busy = isinstance(error, LockError)
     if not busy:
         record("storage_failed", logging.WARNING, path=path, error=type(error).__name__)
-    description = BUSY if busy else UNAVAILABLE
     if path == "/token":
-        content = TokenErrorResponse(error=RETRY_ERROR, error_description=description)
+        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY if busy else UNAVAILABLE)
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
-    # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
-    content = {"error": "temporarily_unavailable", "error_description": description}
-    return JSONResponse(content, status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
+    # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later. RFC 7009
+    # defines no body for it, and temporarily_unavailable isn't a token endpoint code.
+    return Response(status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
 
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:

@@ -3,7 +3,7 @@
 import hashlib
 from collections.abc import Iterable
 from types import TracebackType
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
@@ -49,14 +49,17 @@ class Store:
     async def put(self, kind: str, key: str, value: BaseModel, ttl: int | None = None) -> None:
         await self._redis.set(self._key(kind, key), self._encrypt(kind, key, value), ex=_ttl(ttl))
 
-    async def write(self, put: Iterable[tuple[str, str, BaseModel, int]] = (), delete: Iterable[tuple[str, str]] = ()) -> None:
-        """Deletes, then puts, in one MULTI/EXEC: a crash or a cancellation leaves all of them or none."""
+    async def write(
+        self, put: Iterable[tuple[str, str, BaseModel, int]] = (), delete: Iterable[tuple[str, str]] = ()
+    ) -> list[Any]:
+        """Deletes, then puts, in one MULTI/EXEC: a crash or a cancellation leaves all of them or none. Returns the
+        commands' results in that order: for each delete, the number of keys it removed."""
         async with self._redis.pipeline(transaction=True) as pipe:
             for kind, key in delete:
                 pipe.delete(self._key(kind, key))
             for kind, key, value, ttl in put:
                 pipe.set(self._key(kind, key), self._encrypt(kind, key, value), ex=_ttl(ttl))
-            await pipe.execute()
+            return await pipe.execute()
 
     async def get(self, kind: str, key: str, model: type[M]) -> M | None:
         return self._load(kind, key, await self._redis.get(self._key(kind, key)), model)

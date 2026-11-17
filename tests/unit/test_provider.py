@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 
@@ -12,6 +13,8 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AuthorizationParams, TokenError
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.auth import OAuthClientInformationFull
+from redis.asyncio.lock import Lock
+from redis.exceptions import LockNotOwnedError
 from starlette.requests import Request
 
 from lightdash_mcp.auth import provider as provider_module
@@ -142,6 +145,34 @@ async def test_revoke_ends_the_grant_upstream_too(provider, caplog):
     # Lightdash's client credentials, as RFC 7009 asks of a confidential client.
     assert sent == {"token": "ld-refresh-grant", "token_type_hint": "refresh_token", "client_id": "id", "client_secret": "secret"}
     assert "lightdash_revoke_failed" not in caplog.text
+
+
+async def test_a_second_revocation_of_an_ended_grant_logs_nothing(provider, caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    token = await provider.load_access_token(await add_grant(provider, 3600))
+    await provider.end_grant("grant", "test")
+    await provider.revoke_token(token)
+    assert audit_events(caplog) == ["grant_ended"]
+
+
+@respx.mock
+async def test_a_revocation_that_outlasts_its_lock_still_finishes(provider, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    token = await provider.load_access_token(await add_grant(provider, 3600))
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+
+    async def expired(self):
+        raise LockNotOwnedError("Cannot release a lock that's no longer owned")
+
+    monkeypatch.setattr(Lock, "release", expired)
+    await provider.revoke_token(token)
+    assert audit_events(caplog) == ["token_revoked", "grant_ended"]
+    assert await provider.load_access_token(token.token) is None
+    assert revoke.called
+
+
+def audit_events(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [json.loads(r.getMessage())["event"] for r in caplog.records if r.name == "lightdash_mcp.audit"]
 
 
 @respx.mock

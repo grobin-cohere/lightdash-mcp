@@ -60,8 +60,8 @@ Registration is open, as MCP clients need, so it checks what it stores:
 - A refresh token works once. Its digest is kept for 14 days after its exchange: presented again by its client, it was copied, and the grant ends, here and on Lightdash. A second refresh still in flight with the same token is only refused.
 - When Lightdash refuses a refresh with `invalid_grant`, the grant ends and the user signs in again. Any other error, such as `invalid_client` from a wrong client secret, a malformed answer, or Lightdash being unreachable, keeps the grant and the client's refresh token so it can retry.
 - Revoking a token ends the grant here and revokes its refresh token on Lightdash, with this server's Lightdash client credentials. A refusal or a failure there is logged. The revocation waits for a refresh in flight on the same grant, so the refresh can't bring the grant back or issue tokens after it.
-- Ending a grant deletes it and its tokens in one Redis transaction too.
-- A lock that expires before its holder releases it, or that Redis fails to release, is not an error: the work under it is saved by then. A lock left behind expires after its 30 seconds, and until then the grant's next exchange or revocation finds it busy. For a refresh, an error would hide new tokens that have already replaced the old ones. For the same reason, a failure to renew the client registration's expiry after an exchange is ignored.
+- Ending a grant deletes it and its tokens in one Redis transaction too. Only the request whose transaction removes the grant logs its end.
+- A lock that expires before its holder releases it, or that Redis fails to release, is not an error: the work under it is saved by then. A lock left behind expires after its 30 seconds, and until then the grant's next exchange or revocation finds it busy. For a refresh, an error would hide new tokens that have already replaced the old ones. For the same reason, a failure to renew the client registration's expiry after an exchange is ignored. A refresh rarely outlasts the lock, as it gives up on Lightdash after 20 seconds. If one does, a revocation that took the expired lock meanwhile can't stop it: the refresh puts the grant back.
 
 ### When `/token` or `/revoke` can't finish for now
 
@@ -69,12 +69,12 @@ Registration is open, as MCP clients need, so it checks what it stores:
 | --- | --- | --- |
 | Lightdash fails a refresh: unreachable, no answer in 20 seconds, an error status other than `invalid_grant`, or a malformed answer | `/token`: 400 `invalid_request`, with why and "Try again in a moment." | The grant and the refresh token |
 | The grant's lock stays busy for 30 seconds, during a code or refresh exchange | `/token`: 400 `invalid_request`, "Try again in a moment." | The grant, and the code or refresh token |
-| The lock stays busy while a reused refresh token is found | `/token`: the same 400 `invalid_request`. The grant ends when the token is presented again | The grant, until then |
-| The lock stays busy during a revocation | `/revoke`: 503, `Retry-After: 5` | The grant and its tokens |
+| The lock stays busy while a reused refresh token is found | `/token`: the same 400 `invalid_request`. The grant ends only if the token is presented again, and nothing is logged until then | The grant |
+| The lock stays busy during a revocation | `/revoke`: 503, `Retry-After: 5`, no body | The grant and its tokens |
 | Redis fails or doesn't answer in 5 seconds (`REDIS_TIMEOUT`), anywhere in `/token`: the client lookup, loading the code or refresh token (also from a Bearer header), the exchange | `/token`: 400 `invalid_request`, "This server's storage didn't answer. Try again in a moment." | The grant, and the refresh token. The code too, unless it failed after the code was taken (below) |
-| Redis fails or doesn't answer anywhere in `/revoke` | `/revoke`: 503, `Retry-After: 5` | The grant and its tokens, unless only the answer to the transaction that ends the grant was lost (below) |
+| Redis fails or doesn't answer anywhere in `/revoke` | `/revoke`: 503, `Retry-After: 5`, no body | The grant and its tokens, unless only the answer to the transaction that ends the grant was lost (below) |
 
-Why `invalid_request` on `/token`: RFC 6749 section 5.2 has no `server_error` or `temporarily_unavailable` code for the token endpoint, and the MCP SDK fails with a 500 on any code outside RFC 6749's. Of the codes it allows, `invalid_grant` tells clients that the session has ended, so they drop it and sign in again. `invalid_client` and `unauthorized_client` make some clients drop their registration. `invalid_request` says nothing about the grant or the client, so a client can retry with the same code or refresh token.
+Why `invalid_request` on `/token`: RFC 6749 section 5.2 has no `server_error` or `temporarily_unavailable` code for the token endpoint, and the MCP SDK fails with a 500 on any code outside its list: RFC 6749's codes and RFC 8707's `invalid_target`. Of the codes it allows, `invalid_grant` tells clients that the session has ended, so they drop it and sign in again. `invalid_client` and `unauthorized_client` make some clients drop their registration. `invalid_request` says nothing about the grant or the client, so a client may retry with the same code or refresh token. Not every client does: the MCP Python SDK's client drops its tokens after any failed refresh and signs in again.
 
 Why 503 on `/revoke`: RFC 7009 section 2.2.1 says that after a 503 the client must assume the token still works, and may try again later. Ending the grant without its lock would let the exchange in flight bring the grant back.
 
@@ -131,7 +131,8 @@ The `lightdash_mcp.audit` logger writes one JSON object per line, so a value sen
 | `grant_created` | A Lightdash sign-in finishes | `grant`, `subject`, `client_id` |
 | `sign_in_failed` | Lightdash's code exchange or user lookup fails, at WARNING | `client_id` |
 | `refresh_failed` | A Lightdash refresh fails but keeps the grant, at WARNING | `grant`, `subject`, `client_id`, `reason` |
-| `token_revoked` | A client revokes a token | `grant`, `subject`, `client_id` |
+| `token_revoked` | A client's revocation ends a grant, once the grant is removed, before `grant_ended`. A token whose grant has already ended is revoked without a log line | `grant`, `subject`, `client_id` |
+| `revoke_busy` | A revocation fails because the grant's lock stays busy for 30 seconds, at WARNING. `/revoke` answers 503, and the grant and its tokens are kept | `grant`, `subject`, `client_id` |
 | `grant_ended` | A grant ends | `grant`, `subject`, `client_id`, `reason`: `revoked`, `lightdash_refused_refresh` or `refresh_token_reused` |
 | `lightdash_revoke_failed` | Lightdash refuses or misses a revocation, at WARNING | `grant`, `subject`, `failure` (status or error) |
 | `storage_failed` | Redis fails or doesn't answer during `/token` or `/revoke`, at WARNING | `path`, `error` (the Redis error's class) |
