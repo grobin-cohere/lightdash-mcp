@@ -313,6 +313,23 @@ async def test_the_audit_log_follows_a_sign_in_without_its_secrets(http, setting
     assert not [secret for secret in secrets if secret in caplog.text]
 
 
+@respx.mock
+async def test_a_revocation_while_the_grant_is_busy_logs_no_token_revoked(http, settings, redis, held_lock, caplog):
+    caplog.set_level(logging.INFO, "lightdash_mcp.audit")
+    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    async with held_lock:
+        failed = await http.post("/revoke", data={"token": tokens["access_token"], **credentials(client)})
+
+    assert failed.status_code == 503, failed.text
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
+    assert [line["event"] for line in lines] == ["client_registered", "revoke_busy"]
+    assert (lines[-1]["grant"], lines[-1]["subject"], lines[-1]["client_id"]) == ("grant", "user", client["client_id"])
+    assert [r.levelno for r in caplog.records if "revoke_busy" in r.getMessage()] == [logging.WARNING]
+
+
 async def test_stopping_closes_the_http_client_and_redis(settings, redis, monkeypatch):
     closed = []
     monkeypatch.setattr(Store, "close", lambda self: closed.append("redis") or _done())
