@@ -34,7 +34,7 @@ from starlette.responses import RedirectResponse, Response
 
 from lightdash_mcp.auth import pages
 from lightdash_mcp.auth.audit import clip, record
-from lightdash_mcp.auth.store import LOCK_TIMEOUT, Store, digest
+from lightdash_mcp.auth.store import LOCK_TIMEOUT, REDIS_COMMAND_TIMEOUT, Store, digest
 from lightdash_mcp.config import LOOPBACK_HOSTS, Settings
 
 SCOPE = "lightdash"
@@ -45,7 +45,9 @@ ACCESS_TTL = 60 * 60
 REFRESH_TTL = 14 * 24 * 60 * 60  # Lightdash's refresh-token lifetime
 GRANT_LIFETIME = 90 * 24 * 60 * 60  # then the user signs in again, however often the client refreshes
 REFRESH_MARGIN = 60
-REFRESH_TIMEOUT = LOCK_TIMEOUT - 10  # a refresh ends while it still holds the grant's lock
+# A refresh ends while it still holds the grant's lock: under it, Redis takes the lock, reads the grant, saves the new
+# Lightdash tokens and writes the new tokens (or ends the grant: two commands too).
+REFRESH_TIMEOUT = LOCK_TIMEOUT - 4 * REDIS_COMMAND_TIMEOUT
 CLIENT_TTL = 30 * 24 * 60 * 60  # renewed on each token exchange: registration is open, so unused clients must expire
 CONSENT_COOKIE = "lightdash_mcp_consent"  # one per transaction, suffixed with its digest
 FORM_LIMIT = 64 * 1024  # bytes of a form body: /token, /revoke and the consent page

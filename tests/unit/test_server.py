@@ -14,6 +14,7 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 from redis.asyncio.client import Pipeline
 from redis.asyncio.lock import Lock
+from redis.asyncio.retry import Retry
 from redis.exceptions import ConnectionError
 
 from lightdash_mcp import server as server_module
@@ -154,7 +155,7 @@ async def test_a_basic_auth_client_can_revoke(http, settings, redis):
 @pytest.fixture
 def held_lock(redis, monkeypatch):
     """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up after 0.1 seconds."""
-    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
+    monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
     return redis.lock("lightdash-mcp:lock:grant:grant", timeout=60)
 
 
@@ -546,6 +547,10 @@ async def _fail() -> None:
 
 def test_redis_requests_time_out(settings, monkeypatch):
     created = {}
+    from_url = server_module.Redis.from_url
     monkeypatch.setattr(server_module.Redis, "from_url", lambda url, **options: created.update(options) or FakeAsyncRedis())
     create_server(settings)
     assert created["socket_timeout"] and created["socket_connect_timeout"]
+    assert isinstance(created["retry"], Retry) and created["retry"].get_retries() == 1  # the async Retry, not redis.retry's
+    # The commands retry with the pool's connections' policy, not the client's.
+    assert from_url(settings.redis_url, **created).connection_pool.make_connection().retry.get_retries() == 1

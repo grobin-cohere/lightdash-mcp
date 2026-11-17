@@ -250,8 +250,22 @@ async def test_malformed_refresh_answer_is_a_retryable_tool_error(provider):
         auth_context_var.reset(reset)
 
 
+async def test_a_lock_finds_its_own_token_after_a_lost_answer(provider, monkeypatch):
+    monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
+    lock = provider.store.lock("grant", "grant")
+    # As a SET NX that Redis applied, but whose answer was lost, leaves it for the retry.
+    await lock.redis.set(lock.name, b"mine", px=60_000)
+    assert await lock.acquire(token=b"mine")
+    assert not await provider.store.lock("grant", "grant").acquire(token=b"another")
+
+
+def test_the_grant_lock_outlasts_a_refresh_and_its_redis_commands():
+    assert provider_module.REFRESH_TIMEOUT >= 10
+    assert provider_module.REFRESH_TIMEOUT + 4 * store_module.REDIS_COMMAND_TIMEOUT <= store_module.LOCK_TIMEOUT
+
+
 async def test_a_refresh_lock_held_too_long_is_a_retryable_tool_error(provider, monkeypatch):
-    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
+    monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
     access = await add_grant(provider, 10)
     reset = signed_in_as(await provider.load_access_token(access))
     try:

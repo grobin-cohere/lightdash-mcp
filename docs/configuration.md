@@ -149,7 +149,7 @@ Anyone who can write to Redis can end sign-ins, or fill it. Values are encrypted
 
 - Give Redis a password (`requirepass`, or an ACL user), put it in `REDIS_URL`, and listen on `127.0.0.1` only.
 - Cap its memory, so unauthenticated registrations can't fill the machine: `maxmemory 256mb` with `maxmemory-policy volatile-ttl`. Every key this server writes has a TTL, and `volatile-ttl` drops those closest to expiry first, such as sign-in requests.
-- The server gives up on a Redis request after 5 seconds, so a Redis that stops answering fails requests instead of hanging them.
+- The server gives up on a Redis request after 5 seconds, and tries it once more, on a new connection, after a timeout or a connection error. When Redis stops answering, each Redis command fails after about 10 seconds instead of hanging the request, and a connection that Redis closed, such as after a restart, doesn't fail the next request.
 
 ```bash
 redis-server --bind 127.0.0.1 --port 6380 --requirepass '<password>' --maxmemory 256mb --maxmemory-policy volatile-ttl
