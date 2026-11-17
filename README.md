@@ -67,7 +67,7 @@ Needs Python 3.15+, uv, Redis, and a Lightdash instance (tested on 3.93.6). Its 
    Or run the [Docker image](https://github.com/grobin-cohere/lightdash-mcp/pkgs/container/lightdash-mcp) instead, as in [Run](https://github.com/grobin-cohere/lightdash-mcp/blob/main/docs/configuration.md#run):
 
    ```bash
-   docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
+   docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.2
    ```
 
    Inside the container, `localhost` is the container itself. Set `REDIS_URL` to an address the container reaches, such as `redis://host.docker.internal:6379/0` for Redis on the host. Each release has its own image tag, and `:latest` follows the newest one.
