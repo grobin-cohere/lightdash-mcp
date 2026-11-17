@@ -76,7 +76,7 @@ FORWARDED_ERRORS = ("access_denied", "temporarily_unavailable")
 # server_error for it, and the SDK accepts no code outside RFC 6749's: invalid_request is the one that says nothing
 # about the grant or the client. invalid_grant would end the client's session, invalid_client its registration.
 RETRY_ERROR = "invalid_request"
-BUSY = "Another request is refreshing or ending this sign-in. Try again in a moment."
+GRANT_BUSY = "Another request is refreshing or ending this sign-in. Try again in a moment."
 
 
 class SignInRequired(Exception):
@@ -387,7 +387,8 @@ class LightdashOAuthProvider:
                     raise TokenError("invalid_grant", "Sign-in ended")
                 tokens = await self._issue(grant_id, grant, authorization_code.scopes, authorization_code.resource)
         except LockError:
-            raise TokenError(RETRY_ERROR, BUSY) from None  # the code isn't used yet
+            # Only taking the lock raises it (Store.lock), so nothing under it has run: the code isn't used yet.
+            raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
         return tokens
 
@@ -423,7 +424,7 @@ class LightdashOAuthProvider:
                     raise TokenError(RETRY_ERROR, str(error)) from None
                 tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
         except LockError:
-            raise TokenError(RETRY_ERROR, BUSY) from None
+            raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
         return tokens
 

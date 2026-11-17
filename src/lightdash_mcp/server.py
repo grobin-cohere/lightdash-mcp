@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lightdash_mcp.auth.audit import clip, clip_arguments, record
-from lightdash_mcp.auth.provider import BUSY, FORM_LIMIT, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
+from lightdash_mcp.auth.provider import FORM_LIMIT, GRANT_BUSY, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
 from lightdash_mcp.auth.store import Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
@@ -157,12 +157,11 @@ async def busy(request: Request, error: Exception) -> Response:
     """A grant's lock stayed busy where the SDK catches no error: in /revoke, and in /token's reuse check of a refresh
     token, which ends the grant. The exchanges themselves answer a busy lock with a TokenError."""
     if request.url.path == "/token":
-        content = TokenErrorResponse(error=RETRY_ERROR, error_description=BUSY)
+        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY)
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
     if request.url.path == "/revoke":
         # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
-        content = {"error": "temporarily_unavailable", "error_description": BUSY}
-        return JSONResponse(content, status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
+        return Response(status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
     raise error
 
 

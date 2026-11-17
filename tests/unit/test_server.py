@@ -126,7 +126,7 @@ async def test_a_code_works_for_its_own_client_only(http, settings, redis):
 async def test_a_refresh_token_works_for_its_own_client_only(http, settings, redis):
     client, other = await register(http), await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
-    respx.post(f"{LIGHTDASH}/api/v1/oauth/token").mock(return_value=REFRESHED)
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
     stolen = await refresh(http, other, tokens["refresh_token"])
     assert (stolen.status_code, stolen.json()["error"]) == (400, "invalid_grant")
@@ -142,14 +142,14 @@ async def test_a_basic_auth_client_can_revoke(http, settings, redis):
     assert tokens.status_code == 200, tokens.text
 
     with respx.mock:
-        respx.post(f"{LIGHTDASH}/api/v1/oauth/revoke").mock(return_value=httpx.Response(200))
+        respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
         revoked = await http.post("/revoke", headers=basic, data={"token": tokens.json()["access_token"]})
     assert revoked.status_code == 200, revoked.text
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
 
 
 @pytest.fixture
-def busy(redis, monkeypatch):
+def held_lock(redis, monkeypatch):
     """The lock of grant `grant`, to hold as a request in flight would. Waiting for it gives up after 0.1 seconds."""
     monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
     return redis.lock("lightdash-mcp:lock:grant:grant", timeout=60)
@@ -158,7 +158,8 @@ def busy(redis, monkeypatch):
 def retryable(response: httpx.Response) -> bool:
     """An OAuth error that tells the client to try again with the same code or refresh token, which still work."""
     body = response.json()
-    return response.status_code == 400 and body["error"] == "invalid_request" and "Try again" in body["error_description"]
+    retry = body["error"] == "invalid_request" and "Try again" in body["error_description"]
+    return response.status_code == 400 and retry and response.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.parametrize(
@@ -179,7 +180,6 @@ async def test_a_refresh_lightdash_fails_can_be_retried(http, settings, redis, l
 
     failed = await refresh(http, client, tokens["refresh_token"])
     assert retryable(failed), failed.text
-    assert failed.headers["cache-control"] == "no-store"
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
 
     route.mock(side_effect=None, return_value=REFRESHED)
@@ -187,12 +187,12 @@ async def test_a_refresh_lightdash_fails_can_be_retried(http, settings, redis, l
 
 
 @respx.mock
-async def test_a_refresh_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+async def test_a_refresh_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
     client = await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
     route = respx.post(TOKEN_URL).mock(return_value=REFRESHED)
 
-    async with busy:
+    async with held_lock:
         failed = await refresh(http, client, tokens["refresh_token"])
     assert retryable(failed), failed.text
     assert not route.called
@@ -200,27 +200,28 @@ async def test_a_refresh_while_the_grant_is_busy_can_be_retried(http, settings, 
     assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
 
 
-async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+async def test_a_code_exchange_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
     client = await register(http)
     code = await add_code(settings, redis, client)
-    async with busy:
+    async with held_lock:
         failed = await exchange(http, client, code)
     assert retryable(failed), failed.text
     assert (await exchange(http, client, code)).status_code == 200
 
 
 @respx.mock
-async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(http, settings, redis, busy):
+async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_grant(http, settings, redis, held_lock):
     client = await register(http)
     first = (await exchange(http, client, await add_code(settings, redis, client))).json()
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
-    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
     assert (await refresh(http, client, first["refresh_token"])).status_code == 200
 
     # Reuse is found while the token loads, outside the SDK's error handling: the grant can't end with its lock busy.
-    async with busy:
+    async with held_lock:
         failed = await refresh(http, client, first["refresh_token"])
     assert retryable(failed), failed.text
+    assert not revoke.called
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
 
     reused = await refresh(http, client, first["refresh_token"])
@@ -229,17 +230,18 @@ async def test_a_reused_refresh_token_while_the_grant_is_busy_still_ends_the_gra
 
 
 @respx.mock
-async def test_a_revocation_while_the_grant_is_busy_can_be_retried(http, settings, redis, busy):
+async def test_a_revocation_while_the_grant_is_busy_can_be_retried(http, settings, redis, held_lock):
     client = await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
-    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
     form = {"token": tokens["access_token"], **credentials(client)}
 
-    async with busy:
+    async with held_lock:
         failed = await http.post("/revoke", data=form)
     # RFC 7009 section 2.2.1: the client must assume the token still works, and may retry.
     assert failed.status_code == 503, failed.text
     assert failed.headers["retry-after"]
+    assert not revoke.called
     assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
 
     assert (await http.post("/revoke", data=form)).status_code == 200
@@ -299,8 +301,8 @@ async def test_the_audit_log_follows_a_sign_in_without_its_secrets(http, setting
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
     client = await register(http)
     tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
-    respx.post(f"{LIGHTDASH}/api/v1/oauth/token").mock(return_value=REFRESHED)
-    respx.post(f"{LIGHTDASH}/api/v1/oauth/revoke").mock(return_value=httpx.Response(200))
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+    respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
     tokens = (await refresh(http, client, tokens["refresh_token"])).json()
     await http.post("/revoke", data={"token": tokens["refresh_token"], **credentials(client)})
 
