@@ -5,23 +5,16 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from lightdash_mcp.auth.provider import LightdashOAuthProvider
-from lightdash_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, data, lightdash
+from lightdash_mcp.lightdash import LightdashClient
+from lightdash_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, lightdash
+from lightdash_mcp.tools.shared import every_page
 
-# Fields Lightdash expects back when a scheduler is updated: PATCH takes the whole scheduler.
-UPDATABLE = (
-    "name",
-    "message",
-    "format",
-    "cron",
-    "timezone",
-    "options",
-    "targets",
-    "includeLinks",
-    "enabled",
-    "thresholds",
-    "notificationFrequency",
-    "plainTextEmail",
-)
+
+async def update(ld: LightdashClient, scheduler_uuid: str, changes: dict[str, Any]) -> dict[str, Any]:
+    # PATCH writes every column, so a field left out becomes null (SchedulerModel.updateScheduler):
+    # send the whole scheduler back with the changes. Lightdash ignores the read-only fields.
+    current = await ld.get(f"/api/v1/schedulers/{scheduler_uuid}")
+    return await ld.request("PATCH", f"/api/v1/schedulers/{scheduler_uuid}", json=current | changes)
 
 
 def _summary(s: dict[str, Any]) -> dict[str, Any]:
@@ -44,8 +37,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def list_schedulers(project_uuid: Uuid, search: str | None = None) -> list[dict[str, Any]]:
         """List a project's scheduled deliveries with their schedule, owner, recipients and latest run."""
         async with lightdash(provider) as ld:
-            schedulers = data(
-                await ld.get(f"/api/v1/schedulers/{project_uuid}/list", searchQuery=search, includeLatestRun="true")
+            schedulers = await every_page(
+                ld, f"/api/v1/schedulers/{project_uuid}/list", searchQuery=search, includeLatestRun="true"
             )
         return [_summary(s) for s in schedulers]
 
@@ -70,10 +63,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             k: v for k, v in {"name": name, "cron": cron, "timezone": timezone, "message": message}.items() if v is not None
         }
         async with lightdash(provider) as ld:
-            current = await ld.get(f"/api/v1/schedulers/{scheduler_uuid}")
-            body = {k: current[k] for k in UPDATABLE if k in current} | changes
-            updated = await ld.request("PATCH", f"/api/v1/schedulers/{scheduler_uuid}", json=body)
-        return _summary(updated)
+            return _summary(await update(ld, scheduler_uuid, changes))
 
     @server.tool(annotations=DESTRUCTIVE)
     async def delete_scheduler(scheduler_uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:

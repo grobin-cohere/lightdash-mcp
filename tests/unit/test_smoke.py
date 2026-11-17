@@ -125,3 +125,33 @@ def test_access_token_lifetime_is_bounded():
     assert Settings(_env_file=None, access_token_ttl=86400).access_token_ttl == 86400
     with pytest.raises(ValueError):
         Settings(_env_file=None, access_token_ttl=30 * 24 * 60 * 60)
+
+
+def required() -> dict:
+    return {"_env_file": None, "lightdash_client_id": "id", "lightdash_client_secret": "secret", "fernet_key": "key"}
+
+
+def test_addresses_are_checked_at_start(caplog):
+    Settings(**required()).check()
+    Settings(**required(), host="127.0.0.1", public_url="https://lightdash-mcp.tail5566.ts.net").check()
+    assert not caplog.records
+    for address, error in [
+        ({"lightdash_url": "lightdash.example.com"}, "LIGHTDASH_URL"),
+        ({"lightdash_url": "ftp://lightdash.example.com"}, "LIGHTDASH_URL"),
+        ({"public_url": "http://mcp.example.com"}, "PUBLIC_URL must be https"),
+        ({"public_url": "https://example.com/mcp"}, "at the root"),
+        ({"public_url": "mcp.example.com"}, "PUBLIC_URL"),
+    ]:
+        with pytest.raises(SystemExit, match=error):
+            Settings(**required(), **address).check()
+
+    # Listening on every interface behind an HTTPS address lets clients around the proxy: allowed, as Docker's
+    # published ports need it, but said loudly.
+    Settings(**required(), host="0.0.0.0", public_url="https://mcp.example.com").check()
+    assert "HOST=0.0.0.0" in caplog.text
+
+
+def test_redirect_hosts_are_a_comma_separated_list(monkeypatch):
+    assert Settings(_env_file=None).redirect_hosts == []
+    monkeypatch.setenv("REDIRECT_HOSTS", "dex.example.com, North.Example.com,")
+    assert Settings(_env_file=None).redirect_hosts == ["dex.example.com", "north.example.com"]
