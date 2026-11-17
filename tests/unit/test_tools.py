@@ -195,7 +195,9 @@ async def test_tools_keep_their_annotations_and_destructive_ones_dry_run_by_defa
 @respx.mock
 async def test_access_changes_only_preview_on_a_dry_run(client):
     respx.get(f"{LIGHTDASH}/api/v1/org/users").mock(
-        return_value=page_of([{"userUuid": USER, "email": "Alice@example.com", "role": "viewer", "groups": []}])
+        return_value=page_of(
+            [{"userUuid": USER, "email": "Alice@example.com", "role": "viewer", "groups": []}]
+        )
     )
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access").mock(
         return_value=results([{"userUuid": USER, "email": "alice@example.com", "role": "viewer"}])
@@ -203,14 +205,26 @@ async def test_access_changes_only_preview_on_a_dry_run(client):
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/groupAccesses").mock(
         return_value=results([{"groupUuid": GROUP, "role": "admin"}])
     )
-    respx.get(f"{LIGHTDASH}/api/v1/org/groups").mock(return_value=page_of([{"uuid": GROUP, "name": "Admins"}]))
-    respx.get(f"{LIGHTDASH}/api/v1/groups/{GROUP}").mock(return_value=results({"uuid": GROUP, "name": "Admins"}))
+    respx.get(f"{LIGHTDASH}/api/v1/org/groups").mock(
+        return_value=page_of([{"uuid": GROUP, "name": "Admins"}])
+    )
+    respx.get(f"{LIGHTDASH}/api/v1/groups/{GROUP}").mock(
+        return_value=results({"uuid": GROUP, "name": "Admins"})
+    )
     respx.get(f"{LIGHTDASH}/api/v1/groups/{GROUP}/members").mock(return_value=results([]))
-    respx.get(f"{LIGHTDASH}/api/v1/org/projects").mock(return_value=results([{"projectUuid": PROJECT, "name": "Jaffle"}]))
+    respx.get(f"{LIGHTDASH}/api/v1/org/projects").mock(
+        return_value=results([{"projectUuid": PROJECT, "name": "Jaffle"}])
+    )
     writes = [
-        respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access").mock(return_value=httpx.Response(200)),
-        respx.patch(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access/{USER}").mock(return_value=httpx.Response(200)),
-        respx.put(f"{LIGHTDASH}/api/v1/groups/{GROUP}/members/{USER}").mock(return_value=httpx.Response(204)),
+        respx.post(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access").mock(
+            return_value=httpx.Response(200)
+        ),
+        respx.patch(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access/{USER}").mock(
+            return_value=httpx.Response(200)
+        ),
+        respx.put(f"{LIGHTDASH}/api/v1/groups/{GROUP}/members/{USER}").mock(
+            return_value=httpx.Response(204)
+        ),
     ]
 
     granted = await grant(client, PROJECT, "alice@example.com", "admin", dry_run=True)
@@ -222,7 +236,12 @@ async def test_access_changes_only_preview_on_a_dry_run(client):
         "groups": [],
     }
     changed = await update_grant(client, PROJECT, USER, "admin", dry_run=True)
-    assert changed["wouldChange"] == {"userUuid": USER, "email": "alice@example.com", "from": "viewer", "to": "admin"}
+    assert changed["wouldChange"] == {
+        "userUuid": USER,
+        "email": "alice@example.com",
+        "from": "viewer",
+        "to": "admin",
+    }
     added = await add_member(client, GROUP, USER, dry_run=True)
     assert added["wouldAdd"] == {"userUuid": USER, "group": "Admins"}
     assert added["groupGives"] == [{"projectUuid": PROJECT, "project": "Jaffle", "role": "admin"}]
@@ -232,7 +251,11 @@ async def test_access_changes_only_preview_on_a_dry_run(client):
     await update_grant(client, PROJECT, USER, "admin", dry_run=False)
     await add_member(client, GROUP, USER, dry_run=False)
     assert all(route.call_count == 1 for route in writes)
-    assert json.loads(writes[0].calls[0].request.content) == {"email": "alice@example.com", "role": "admin", "sendEmail": False}
+    assert json.loads(writes[0].calls[0].request.content) == {
+        "email": "alice@example.com",
+        "role": "admin",
+        "sendEmail": False,
+    }
 
 
 @respx.mock
@@ -257,7 +280,12 @@ async def test_project_access_is_the_highest_role_from_any_source(client):
         )
     )
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/access").mock(
-        return_value=results([{"userUuid": "direct-editor", "role": "editor"}, {"userUuid": "org-admin", "role": "viewer"}])
+        return_value=results(
+            [
+                {"userUuid": "direct-editor", "role": "editor"},
+                {"userUuid": "org-admin", "role": "viewer"},
+            ]
+        )
     )
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/groupAccesses").mock(
         return_value=results(
@@ -268,7 +296,9 @@ async def test_project_access_is_the_highest_role_from_any_source(client):
             ]
         )
     )
-    respx.get(f"{LIGHTDASH}/api/v1/org/groups").mock(return_value=page_of([{"uuid": "viewers", "name": "Viewers"}]))
+    respx.get(f"{LIGHTDASH}/api/v1/org/groups").mock(
+        return_value=page_of([{"uuid": "viewers", "name": "Viewers"}])
+    )
 
     access = await project_access(client, PROJECT)
     users = {u["userUuid"]: u for u in access["users"]}
@@ -281,7 +311,11 @@ async def test_project_access_is_the_highest_role_from_any_source(client):
     }
     assert users["custom"]["customRoleUuids"] == ["4b1f0c0e-custom-role"]
     assert users["org-admin"]["directRole"] == "viewer"
-    assert access["groups"][0] == {"groupUuid": "viewers", "name": "Viewers", "projectRole": "viewer"}
+    assert access["groups"][0] == {
+        "groupUuid": "viewers",
+        "name": "Viewers",
+        "projectRole": "viewer",
+    }
 
 
 @respx.mock
@@ -292,7 +326,9 @@ async def test_roles_come_with_their_scopes_when_allowed(client):
         return results([{"roleUuid": "viewer", "name": "Viewer"}])
 
     route = respx.get(f"{LIGHTDASH}/api/v2/orgs/org/roles").mock(
-        return_value=results([{"roleUuid": "viewer", "name": "Viewer", "scopes": ["view:Dashboard"]}])
+        return_value=results(
+            [{"roleUuid": "viewer", "name": "Viewer", "scopes": ["view:Dashboard"]}]
+        )
     )
     assert (await roles(client, "org"))[0]["scopes"] == ["view:Dashboard"]
     assert route.calls[0].request.url.params["load"] == "scopes"
@@ -319,7 +355,14 @@ async def test_scheduler_updates_send_back_every_field(client):
         "name": "Weekly",
         "cron": "0 9 * * 1",
         "targets": [{"schedulerEmailTargetUuid": "t", "recipient": "a@example.com"}],
-        "filters": [{"id": "f", "target": {"fieldId": "orders_status"}, "operator": "equals", "values": ["paid"]}],
+        "filters": [
+            {
+                "id": "f",
+                "target": {"fieldId": "orders_status"},
+                "operator": "equals",
+                "values": ["paid"],
+            }
+        ],
         "parameters": {"region": "EU"},
         "selectedTabs": ["tab"],
         "customViewportWidth": 1400,
@@ -327,7 +370,9 @@ async def test_scheduler_updates_send_back_every_field(client):
         "appState": {"page": 2},
     }
     respx.get(f"{LIGHTDASH}/api/v1/schedulers/{USER}").mock(return_value=results(current))
-    patch = respx.patch(f"{LIGHTDASH}/api/v1/schedulers/{USER}").mock(return_value=results(current | {"name": "Daily"}))
+    patch = respx.patch(f"{LIGHTDASH}/api/v1/schedulers/{USER}").mock(
+        return_value=results(current | {"name": "Daily"})
+    )
     await update(client, USER, {"name": "Daily"})
     assert json.loads(patch.calls[0].request.content) == current | {"name": "Daily"}
 
@@ -353,9 +398,15 @@ async def test_lists_follow_every_page_up_to_a_cap(client):
 @respx.mock
 async def test_queries_are_cancelled_when_they_time_out(client, monkeypatch):
     monkeypatch.setattr(data, "QUERY_TIMEOUT", 0.2)
-    respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/metric-query").mock(return_value=results({"queryUuid": QUERY}))
-    poll = respx.get(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}").mock(return_value=results({"status": "pending"}))
-    cancel = respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}/cancel").mock(return_value=results(None))
+    respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/metric-query").mock(
+        return_value=results({"queryUuid": QUERY})
+    )
+    poll = respx.get(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}").mock(
+        return_value=results({"status": "pending"})
+    )
+    cancel = respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}/cancel").mock(
+        return_value=results(None)
+    )
 
     with pytest.raises(ToolError, match="more than 0.2 seconds and was cancelled"):
         await data._run(client, PROJECT, "metric-query", {}, 10)
@@ -374,11 +425,15 @@ async def test_queries_are_cancelled_when_they_time_out(client, monkeypatch):
 
 @respx.mock
 async def test_queries_are_cancelled_when_polling_fails_or_the_call_is_cancelled(client):
-    respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/metric-query").mock(return_value=results({"queryUuid": QUERY}))
+    respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/metric-query").mock(
+        return_value=results({"queryUuid": QUERY})
+    )
     poll = respx.get(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}").mock(
         return_value=httpx.Response(502, json={"error": {"message": "Bad gateway"}})
     )
-    cancel = respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}/cancel").mock(return_value=results(None))
+    cancel = respx.post(f"{LIGHTDASH}/api/v2/projects/{PROJECT}/query/{QUERY}/cancel").mock(
+        return_value=results(None)
+    )
     with pytest.raises(LightdashError):
         await data._run(client, PROJECT, "metric-query", {}, 10)
     assert cancel.call_count == 1
@@ -395,21 +450,48 @@ async def test_queries_are_cancelled_when_polling_fails_or_the_call_is_cancelled
 @respx.mock
 async def test_content_actions_check_the_item_they_act_on(client):
     space = "2d3c1b0a-1111-4222-8333-444455556666"
-    other = {"uuid": "9e8d7c6b-1111-4222-8333-444455556666", "contentType": "space", "name": "Everything"}
+    other = {
+        "uuid": "9e8d7c6b-1111-4222-8333-444455556666",
+        "contentType": "space",
+        "name": "Everything",
+    }
     route = respx.get(f"{LIGHTDASH}/api/v2/content").mock(return_value=page_of([other]))
     with pytest.raises(ToolError, match=f"No space {space} in this project"):
         await _item(client, PROJECT, "space", space)
 
-    route.mock(return_value=page_of([other, {"uuid": space, "contentType": "space", "name": "Old"}]))
+    route.mock(
+        return_value=page_of([other, {"uuid": space, "contentType": "space", "name": "Old"}])
+    )
     assert (await _item(client, PROJECT, "space", space.upper()))["name"] == "Old"
 
 
 def test_viewed_content_is_not_called_never_viewed():
     old = "2020-01-01T00:00:00+00:00"
     items = [
-        {"uuid": "viewed-no-date", "contentType": "chart", "name": "a", "views": 12, "lastViewedAt": None, "createdAt": old},
-        {"uuid": "never", "contentType": "chart", "name": "b", "views": 0, "lastViewedAt": None, "createdAt": old},
-        {"uuid": "stale", "contentType": "dashboard", "name": "c", "views": 3, "lastViewedAt": old, "createdAt": old},
+        {
+            "uuid": "viewed-no-date",
+            "contentType": "chart",
+            "name": "a",
+            "views": 12,
+            "lastViewedAt": None,
+            "createdAt": old,
+        },
+        {
+            "uuid": "never",
+            "contentType": "chart",
+            "name": "b",
+            "views": 0,
+            "lastViewedAt": None,
+            "createdAt": old,
+        },
+        {
+            "uuid": "stale",
+            "contentType": "dashboard",
+            "name": "c",
+            "views": 3,
+            "lastViewedAt": old,
+            "createdAt": old,
+        },
         {
             "uuid": "recent",
             "contentType": "dashboard",
@@ -423,8 +505,16 @@ def test_viewed_content_is_not_called_never_viewed():
 
 
 def test_content_comes_with_slugs():
-    assert _summary({"contentType": "chart", "uuid": "u", "slug": "revenue", "name": "Revenue"})["slug"] == "revenue"
-    tile = {"type": "saved_chart", "properties": {"savedChartUuid": "u", "chartSlug": "revenue", "chartName": "Revenue"}}
+    assert (
+        _summary({"contentType": "chart", "uuid": "u", "slug": "revenue", "name": "Revenue"})[
+            "slug"
+        ]
+        == "revenue"
+    )
+    tile = {
+        "type": "saved_chart",
+        "properties": {"savedChartUuid": "u", "chartSlug": "revenue", "chartName": "Revenue"},
+    }
     assert _tile(tile, {})["chartSlug"] == "revenue"
     assert space_slug({"slug": "my_team", "path": "finance.my_team"}) == "finance/my-team"
 

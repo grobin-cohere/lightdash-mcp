@@ -11,7 +11,7 @@ lightdash-mcp: an MCP server for self-hosted Lightdash (data queries, access, co
 | `make dev` | Start the local Lightdash (Docker, demo data on :8080), create `.env` if missing (`dev/init_env.py`), then run the MCP server on :8000/mcp |
 | `make mcp` | Run the MCP server only |
 | `make test` | `uv run pytest` |
-| `make lint` | `ruff check .` and `ruff format --check .` (line length 130) |
+| `make lint` | `ruff check .` and `ruff format --check .` (line length 100) |
 | `make check` | `dagger check`: CI's checks in containers, with their own Lightdash (needs Docker and the Dagger CLI) |
 | `make logs` / `make stop` / `make clean` | Follow logs / stop / delete containers, volumes, `.lightdash/` and the `.env` created by `make dev` |
 

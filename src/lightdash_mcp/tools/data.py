@@ -89,16 +89,25 @@ def _filter_group(filters: list[Filter]) -> dict[str, Any] | None:
     if not filters:
         return None
     rules = [
-        {"id": str(uuid.uuid4()), "target": {"fieldId": f.field_id}, "operator": f.operator, "values": f.values}
+        {
+            "id": str(uuid.uuid4()),
+            "target": {"fieldId": f.field_id},
+            "operator": f.operator,
+            "values": f.values,
+        }
         | ({"settings": f.settings} if f.settings else {})
         for f in filters
     ]
     return {"id": str(uuid.uuid4()), "and": rules}
 
 
-async def _run(ld: LightdashClient, project_uuid: str, endpoint: str, body: dict[str, Any], page_size: int) -> dict[str, Any]:
+async def _run(
+    ld: LightdashClient, project_uuid: str, endpoint: str, body: dict[str, Any], page_size: int
+) -> dict[str, Any]:
     """Start a Lightdash query, wait for it, and return its first page of results."""
-    started = await ld.request("POST", f"/api/v2/projects/{project_uuid}/query/{endpoint}", json=body | {"context": "api"})
+    started = await ld.request(
+        "POST", f"/api/v2/projects/{project_uuid}/query/{endpoint}", json=body | {"context": "api"}
+    )
     path = f"/api/v2/projects/{project_uuid}/query/{started['queryUuid']}"
     try:
         async with asyncio.timeout(QUERY_TIMEOUT):
@@ -110,7 +119,9 @@ async def _run(ld: LightdashClient, project_uuid: str, endpoint: str, body: dict
             async with asyncio.timeout(CANCEL_TIMEOUT):
                 await ld.request("POST", f"{path}/cancel")
         if isinstance(error, TimeoutError):
-            raise ToolError(f"The query took more than {QUERY_TIMEOUT} seconds and was cancelled.") from None
+            raise ToolError(
+                f"The query took more than {QUERY_TIMEOUT} seconds and was cancelled."
+            ) from None
         raise
     if results["status"] != "ready":
         raise ToolError(f"The query failed ({results['status']}): {results.get('error')}")
@@ -136,7 +147,11 @@ async def _explores(ld: LightdashClient, project_uuid: str) -> list[dict[str, An
             "label": e.get("label"),
             "group": e.get("groupLabel"),
             "description": e.get("description"),
-            **({"errors": [error.get("message") for error in e["errors"]]} if e.get("errors") else {}),
+            **(
+                {"errors": [error.get("message") for error in e["errors"]]}
+                if e.get("errors")
+                else {}
+            ),
         }
         for e in explores
     ]
@@ -179,19 +194,34 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         A filter on a metric applies after aggregation. Date filters such as inThePast take values [n] and
         settings {"unitOfTime": "days"}; inBetween takes two values. Returns up to `limit` rows, at most 2500;
         truncated is true when more rows match."""
-        dimensions, metrics, filters, sorts = dimensions or [], metrics or [], filters or [], sorts or []
+        dimensions, metrics, filters, sorts = (
+            dimensions or [],
+            metrics or [],
+            filters or [],
+            sorts or [],
+        )
         if not dimensions and not metrics:
             raise ToolError("Give at least one dimension or metric.")
         async with lightdash(provider) as ld:
             found = await load_explore(ld, project_uuid, explore)
-            known_dimensions, known_metrics = explore_fields(found, "dimensions"), explore_fields(found, "metrics")
+            known_dimensions, known_metrics = (
+                explore_fields(found, "dimensions"),
+                explore_fields(found, "metrics"),
+            )
             unknown = [
                 f
-                for f in [*dimensions, *metrics, *(f.field_id for f in filters), *(s.field_id for s in sorts)]
+                for f in [
+                    *dimensions,
+                    *metrics,
+                    *(f.field_id for f in filters),
+                    *(s.field_id for s in sorts),
+                ]
                 if f not in known_dimensions and f not in known_metrics
             ]
             if unknown:
-                raise ToolError(f"Unknown fields in {explore}: {', '.join(unknown)}. See get_explore.")
+                raise ToolError(
+                    f"Unknown fields in {explore}: {', '.join(unknown)}. See get_explore."
+                )
             rows = max(1, min(limit, MAX_ROWS))
             query = {
                 "exploreName": explore,
@@ -200,8 +230,14 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 "filters": {
                     key: group
                     for key, group in (
-                        ("dimensions", _filter_group([f for f in filters if f.field_id in known_dimensions])),
-                        ("metrics", _filter_group([f for f in filters if f.field_id in known_metrics])),
+                        (
+                            "dimensions",
+                            _filter_group([f for f in filters if f.field_id in known_dimensions]),
+                        ),
+                        (
+                            "metrics",
+                            _filter_group([f for f in filters if f.field_id in known_metrics]),
+                        ),
                     )
                     if group
                 },
@@ -214,7 +250,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         return _table(results)
 
     @server.tool(annotations=READ)
-    async def run_chart(project_uuid: Uuid, chart_uuid: ChartRef, dashboard_uuid: Uuid | None = None) -> dict[str, Any]:
+    async def run_chart(
+        project_uuid: Uuid, chart_uuid: ChartRef, dashboard_uuid: Uuid | None = None
+    ) -> dict[str, Any]:
         """Run a saved chart as it is saved: its fields, filters, sorts and row limit. chart_uuid is the chart's
         UUID or its slug. Give dashboard_uuid to apply that dashboard's filters too, as people see it on the
         dashboard. Returns at most 2500 rows; truncated is true when there are more."""
@@ -226,7 +264,14 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 dashboard = await ld.get(f"/api/v1/dashboards/{dashboard_uuid}")
                 if dashboard.get("projectUuid") != project_uuid:
                     raise ToolError("This dashboard is not in this project.")
-                tile = next((t for t in dashboard["tiles"] if t["properties"].get("savedChartUuid") == chart_uuid), None)
+                tile = next(
+                    (
+                        t
+                        for t in dashboard["tiles"]
+                        if t["properties"].get("savedChartUuid") == chart_uuid
+                    ),
+                    None,
+                )
                 if tile is None:
                     raise ToolError("This chart is not on the dashboard. See get_dashboard.")
                 body = {

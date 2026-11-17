@@ -30,7 +30,9 @@ def editor_uuid(lightdash_admin: httpx.Client) -> str:
 
 @pytest.fixture
 def space(lightdash_admin: httpx.Client, project_uuid: str):
-    created = lightdash_admin.post(f"/api/v1/projects/{project_uuid}/spaces", json={"name": "mcp test space"})
+    created = lightdash_admin.post(
+        f"/api/v1/projects/{project_uuid}/spaces", json={"name": "mcp test space"}
+    )
     uuid = created.json()["results"]["uuid"]
     yield uuid
     lightdash_admin.delete(f"/api/v1/projects/{project_uuid}/spaces/{uuid}")
@@ -39,7 +41,8 @@ def space(lightdash_admin: httpx.Client, project_uuid: str):
 @pytest.fixture
 def scheduler(lightdash_admin: httpx.Client, project_uuid: str):
     charts = lightdash_admin.get(
-        "/api/v2/content", params={"projectUuids": project_uuid, "contentTypes": "chart", "pageSize": 100}
+        "/api/v2/content",
+        params={"projectUuids": project_uuid, "contentTypes": "chart", "pageSize": 100},
     ).json()["results"]["data"]
     chart = next(c for c in charts if c["chartKind"] in ("vertical_bar", "line", "table"))
     created = lightdash_admin.post(
@@ -78,29 +81,45 @@ async def test_read_tools(admin, tool, project_uuid):
     assert all(r["scopes"] for r in roles if r["name"] == "Viewer")
 
     access = ok(await tool(admin, "list_project_access", {"project_uuid": project_uuid}))
-    assert any(u["email"] == "demo@lightdash.com" and u["projectRole"] == "admin" for u in access["users"])
+    assert any(
+        u["email"] == "demo@lightdash.com" and u["projectRole"] == "admin" for u in access["users"]
+    )
 
     spaces = ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
     assert spaces and all(s["spaceSlug"] for s in spaces)
     space_access = ok(
-        await tool(admin, "list_space_access", {"project_uuid": project_uuid, "space_uuid": spaces[0]["spaceUuid"]})
+        await tool(
+            admin,
+            "list_space_access",
+            {"project_uuid": project_uuid, "space_uuid": spaces[0]["spaceUuid"]},
+        )
     )
     assert space_access["users"]
 
-    unused = ok(await tool(admin, "find_unused_content", {"project_uuid": project_uuid, "unused_days": 0}))
+    unused = ok(
+        await tool(admin, "find_unused_content", {"project_uuid": project_uuid, "unused_days": 0})
+    )
     assert unused and {u["contentType"] for u in unused} <= {"chart", "dashboard"}
 
-    errors = ok(await tool(admin, "list_validation_errors", {"project_uuid": project_uuid, "revalidate": True}))
+    errors = ok(
+        await tool(
+            admin, "list_validation_errors", {"project_uuid": project_uuid, "revalidate": True}
+        )
+    )
     assert isinstance(errors, list)
 
 
 async def test_permissions_follow_the_user(admin, viewer, tool, project_uuid, editor_uuid):
     assert ok(await tool(admin, "list_roles"))
     assert "Permission denied" in denied(await tool(viewer, "list_roles"))
-    assert "Permission denied" in denied(await tool(viewer, "list_schedulers", {"project_uuid": project_uuid}))
+    assert "Permission denied" in denied(
+        await tool(viewer, "list_schedulers", {"project_uuid": project_uuid})
+    )
     message = denied(
         await tool(
-            viewer, "grant_project_access", {"project_uuid": project_uuid, "email": EDITOR, "role": "viewer", "dry_run": False}
+            viewer,
+            "grant_project_access",
+            {"project_uuid": project_uuid, "email": EDITOR, "role": "viewer", "dry_run": False},
         )
     )
     assert "Permission denied" in message
@@ -111,10 +130,15 @@ async def test_project_access_lifecycle(admin, tool, lightdash_admin, project_uu
     args = {"project_uuid": project_uuid}
 
     def direct_role(access) -> str | None:
-        return next((u["directRole"] for u in access["users"] if u["userUuid"] == editor_uuid), None)
+        return next(
+            (u["directRole"] for u in access["users"] if u["userUuid"] == editor_uuid), None
+        )
 
     grant = {**args, "email": EDITOR, "role": "editor"}
-    assert ok(await tool(admin, "grant_project_access", grant))["wouldGrant"] == {"email": EDITOR, "role": "editor"}
+    assert ok(await tool(admin, "grant_project_access", grant))["wouldGrant"] == {
+        "email": EDITOR,
+        "role": "editor",
+    }
     assert direct_role(ok(await tool(admin, "list_project_access", args))) is None
     ok(await tool(admin, "grant_project_access", {**grant, "dry_run": False}))
     assert direct_role(ok(await tool(admin, "list_project_access", args))) == "editor"
@@ -128,7 +152,11 @@ async def test_project_access_lifecycle(admin, tool, lightdash_admin, project_uu
     assert preview["wouldRemove"]["role"] == "viewer"
     assert direct_role(ok(await tool(admin, "list_project_access", args))) == "viewer"
 
-    ok(await tool(admin, "revoke_project_access", {**args, "user_uuid": editor_uuid, "dry_run": False}))
+    ok(
+        await tool(
+            admin, "revoke_project_access", {**args, "user_uuid": editor_uuid, "dry_run": False}
+        )
+    )
     assert direct_role(ok(await tool(admin, "list_project_access", args))) is None
 
 
@@ -137,13 +165,18 @@ async def test_group_membership(admin, tool, editor_uuid):
     args = {"group_uuid": group["groupUuid"], "user_uuid": editor_uuid}
 
     def members() -> set[str]:
-        return {m["userUuid"] for m in next(g for g in groups if g["groupUuid"] == group["groupUuid"])["members"]}
+        return {
+            m["userUuid"]
+            for m in next(g for g in groups if g["groupUuid"] == group["groupUuid"])["members"]
+        }
 
     assert ok(await tool(admin, "add_group_member", args))["wouldAdd"]["group"] == "Org 1 Group"
     groups = ok(await tool(admin, "list_groups"))
     assert editor_uuid not in members()
     ok(await tool(admin, "add_group_member", {**args, "dry_run": False}))
-    assert ok(await tool(admin, "add_group_member", {**args, "dry_run": False}))["added"] is None  # already a member
+    assert (
+        ok(await tool(admin, "add_group_member", {**args, "dry_run": False}))["added"] is None
+    )  # already a member
     groups = ok(await tool(admin, "list_groups"))
     assert editor_uuid in members()
 
@@ -169,13 +202,31 @@ async def test_scheduler_lifecycle(admin, tool, project_uuid, scheduler, lightda
     assert (renamed["cron"], renamed["timezone"]) == ("0 9 * * 1", "UTC")
     assert (stored["timezone"], stored["message"]) == ("UTC", "mcp test message")
 
-    updated = ok(await tool(admin, "update_scheduler", {"scheduler_uuid": scheduler, "name": "renamed", "cron": "0 7 * * 2"}))
-    assert (updated["name"], updated["cron"], updated["recipients"]) == ("renamed", "0 7 * * 2", ["demo@lightdash.com"])
+    updated = ok(
+        await tool(
+            admin,
+            "update_scheduler",
+            {"scheduler_uuid": scheduler, "name": "renamed", "cron": "0 7 * * 2"},
+        )
+    )
+    assert (updated["name"], updated["cron"], updated["recipients"]) == (
+        "renamed",
+        "0 7 * * 2",
+        ["demo@lightdash.com"],
+    )
 
     ok(await tool(admin, "set_scheduler_enabled", {"scheduler_uuid": scheduler, "enabled": False}))
-    assert find(ok(await tool(admin, "list_schedulers", {"project_uuid": project_uuid})))["enabled"] is False
+    assert (
+        find(ok(await tool(admin, "list_schedulers", {"project_uuid": project_uuid})))["enabled"]
+        is False
+    )
 
-    assert ok(await tool(admin, "delete_scheduler", {"scheduler_uuid": scheduler}))["wouldDelete"]["name"] == "renamed"
+    assert (
+        ok(await tool(admin, "delete_scheduler", {"scheduler_uuid": scheduler}))["wouldDelete"][
+            "name"
+        ]
+        == "renamed"
+    )
     assert lightdash_admin.get(f"/api/v1/schedulers/{scheduler}").status_code == 200
     ok(await tool(admin, "delete_scheduler", {"scheduler_uuid": scheduler, "dry_run": False}))
     assert lightdash_admin.get(f"/api/v1/schedulers/{scheduler}").status_code == 404
@@ -183,14 +234,15 @@ async def test_scheduler_lifecycle(admin, tool, project_uuid, scheduler, lightda
 
 async def test_move_and_delete_content(admin, tool, project_uuid, space, lightdash_admin):
     charts = lightdash_admin.get(
-        "/api/v2/content", params={"projectUuids": project_uuid, "contentTypes": "chart", "pageSize": 1}
+        "/api/v2/content",
+        params={"projectUuids": project_uuid, "contentTypes": "chart", "pageSize": 1},
     ).json()["results"]["data"]
     chart, home = charts[0]["uuid"], charts[0]["space"]["uuid"]
 
     def chart_space() -> str:
-        return lightdash_admin.get("/api/v2/content", params={"projectUuids": project_uuid, "uuids": chart}).json()["results"][
-            "data"
-        ][0]["space"]["uuid"]
+        return lightdash_admin.get(
+            "/api/v2/content", params={"projectUuids": project_uuid, "uuids": chart}
+        ).json()["results"]["data"][0]["space"]["uuid"]
 
     move = {"project_uuid": project_uuid, "content_type": "chart", "uuid": chart}
     ok(await tool(admin, "move_content", {**move, "target_space_uuid": space}))
@@ -230,12 +282,22 @@ async def test_data_tools(admin, viewer, tool, project_uuid):
     }
     result = ok(await tool(admin, "run_query", query))
     assert set(result["columns"]) == {"orders_status", "orders_unique_order_count"}
-    counts = [int(r["orders_unique_order_count"]) for r in result["rows"]]  # bigint counts come as strings
-    assert 0 < len(counts) <= 3 and counts == sorted(counts, reverse=True) and all(c > 0 for c in counts)
+    counts = [
+        int(r["orders_unique_order_count"]) for r in result["rows"]
+    ]  # bigint counts come as strings
+    assert (
+        0 < len(counts) <= 3
+        and counts == sorted(counts, reverse=True)
+        and all(c > 0 for c in counts)
+    )
     assert "returned" not in [r["orders_status"] for r in result["rows"]]
 
-    assert "Permission denied" in denied(await tool(viewer, "run_query", query))  # viewers only see saved charts
-    unknown = denied(await tool(admin, "run_query", {**args, "explore": "orders", "metrics": ["orders_nope"]}))
+    assert "Permission denied" in denied(
+        await tool(viewer, "run_query", query)
+    )  # viewers only see saved charts
+    unknown = denied(
+        await tool(admin, "run_query", {**args, "explore": "orders", "metrics": ["orders_nope"]})
+    )
     assert "Unknown fields in orders: orders_nope" in unknown
     statuses = {**args, "explore": "orders", "dimensions": ["orders_status"]}
     assert ok(await tool(admin, "run_query", {**statuses, "limit": 1}))["truncated"] is True
@@ -247,16 +309,31 @@ def filtered_dashboard(lightdash_admin: httpx.Client, project_uuid: str):
     """A dashboard showing revenue per payment method, filtered to credit cards."""
     charts = lightdash_admin.get(
         "/api/v2/content",
-        params={"projectUuids": project_uuid, "contentTypes": "chart", "search": "per payment method"},
+        params={
+            "projectUuids": project_uuid,
+            "contentTypes": "chart",
+            "search": "per payment method",
+        },
     ).json()["results"]["data"]
-    chart = next(c for c in charts if c["name"] == "How much revenue do we have per payment method?")
+    chart = next(
+        c for c in charts if c["name"] == "How much revenue do we have per payment method?"
+    )
     created = lightdash_admin.post(
         f"/api/v1/projects/{project_uuid}/dashboards",
         json={
             "name": "mcp test dashboard",
             "spaceUuid": chart["space"]["uuid"],
             "tabs": [],
-            "tiles": [{"type": "saved_chart", "x": 0, "y": 0, "h": 9, "w": 12, "properties": {"savedChartUuid": chart["uuid"]}}],
+            "tiles": [
+                {
+                    "type": "saved_chart",
+                    "x": 0,
+                    "y": 0,
+                    "h": 9,
+                    "w": 12,
+                    "properties": {"savedChartUuid": chart["uuid"]},
+                }
+            ],
             "filters": {
                 "dimensions": [
                     {
@@ -278,40 +355,79 @@ def filtered_dashboard(lightdash_admin: httpx.Client, project_uuid: str):
 
 async def test_saved_content_tools(viewer, tool, project_uuid, filtered_dashboard):
     args = {"project_uuid": project_uuid}
-    charts = ok(await tool(viewer, "search_content", {**args, "search": "revenue", "content_type": "chart"}))
+    charts = ok(
+        await tool(viewer, "search_content", {**args, "search": "revenue", "content_type": "chart"})
+    )
     assert charts and all(c["contentType"] == "chart" for c in charts)
     assert len(charts) < len(ok(await tool(viewer, "search_content", args)))
 
     dashboard_uuid, chart_uuid = filtered_dashboard
-    assert dashboard_uuid in [d["uuid"] for d in ok(await tool(viewer, "search_content", {**args, "content_type": "dashboard"}))]
+    assert dashboard_uuid in [
+        d["uuid"]
+        for d in ok(await tool(viewer, "search_content", {**args, "content_type": "dashboard"}))
+    ]
     dashboard = ok(await tool(viewer, "get_dashboard", {"dashboard_uuid": dashboard_uuid}))
     assert dashboard["projectUuid"] == project_uuid
     assert dashboard["filters"] == [
-        {"fieldId": "payments_payment_method", "operator": "equals", "values": ["credit_card"], "disabled": False}
+        {
+            "fieldId": "payments_payment_method",
+            "operator": "equals",
+            "values": ["credit_card"],
+            "disabled": False,
+        }
     ]
     assert [t["chartUuid"] for t in dashboard["tiles"]] == [chart_uuid]
 
-    alone = ok(await tool(viewer, "run_chart", {**args, "chart_uuid": chart_uuid}))  # viewers can run saved charts
-    on_dashboard = ok(await tool(viewer, "run_chart", {**args, "chart_uuid": chart_uuid, "dashboard_uuid": dashboard_uuid}))
+    alone = ok(
+        await tool(viewer, "run_chart", {**args, "chart_uuid": chart_uuid})
+    )  # viewers can run saved charts
+    on_dashboard = ok(
+        await tool(
+            viewer,
+            "run_chart",
+            {**args, "chart_uuid": chart_uuid, "dashboard_uuid": dashboard_uuid},
+        )
+    )
     assert len(alone["rows"]) > 1 and alone["truncated"] is False
     assert [r["payments_payment_method"] for r in on_dashboard["rows"]] == ["credit_card"]
     other = "00000000-0000-4000-8000-000000000000"
     assert "not on the dashboard" in denied(
-        await tool(viewer, "run_chart", {**args, "chart_uuid": other, "dashboard_uuid": dashboard_uuid})
+        await tool(
+            viewer, "run_chart", {**args, "chart_uuid": other, "dashboard_uuid": dashboard_uuid}
+        )
     )
 
 
 async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uuid, lightdash_admin):
     args = {"project_uuid": project_uuid}
-    found = ok(await tool(admin, "search_content", {**args, "search": "per payment method", "content_type": "chart"}))
-    source = next((c for c in found if c["name"] == "How much revenue do we have per payment method?"), None)
+    found = ok(
+        await tool(
+            admin,
+            "search_content",
+            {**args, "search": "per payment method", "content_type": "chart"},
+        )
+    )
+    source = next(
+        (c for c in found if c["name"] == "How much revenue do we have per payment method?"), None
+    )
     assert source, found
     suffix = secrets.token_hex(3)
     downloaded = ok(await tool(admin, "get_chart_code", {**args, "slug": source["slug"]}))
     # A copy in the same space: not on the source's dashboard, nor with its access.
-    copied = {k: v for k, v in downloaded.items() if k not in ("dashboardSlug", "access", "updatedAt", "downloadedAt")}
+    copied = {
+        k: v
+        for k, v in downloaded.items()
+        if k not in ("dashboardSlug", "access", "updatedAt", "downloadedAt")
+    }
     chart = copied | {"name": f"mcp test chart {suffix}", "slug": f"mcp-test-chart-{suffix}"}
-    tile = {"type": "saved_chart", "x": 0, "y": 0, "w": 12, "h": 9, "properties": {"chartSlug": chart["slug"]}}
+    tile = {
+        "type": "saved_chart",
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9,
+        "properties": {"chartSlug": chart["slug"]},
+    }
     dashboard = {
         "name": f"mcp test dashboard {suffix}",
         "slug": f"mcp-test-dashboard-{suffix}",
@@ -323,7 +439,8 @@ async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uui
     def leftovers() -> list[dict[str, Any]]:
         """What this test made, found by name: a save can succeed even when its tool call then fails."""
         content = lightdash_admin.get(
-            "/api/v2/content", params={"projectUuids": project_uuid, "search": "mcp test", "pageSize": 100}
+            "/api/v2/content",
+            params={"projectUuids": project_uuid, "search": "mcp test", "pageSize": 100},
         ).json()["results"]["data"]
         return [c for c in content if c["name"].endswith(suffix)]
 
@@ -334,17 +451,31 @@ async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uui
             await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False})
         )
 
-        assert ok(await tool(admin, "save_chart", {**args, "chart": chart}))["wouldCreate"]["slug"] == chart["slug"]
-        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+        assert (
+            ok(await tool(admin, "save_chart", {**args, "chart": chart}))["wouldCreate"]["slug"]
+            == chart["slug"]
+        )
+        assert "No chart with slug" in denied(
+            await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]})
+        )
         created = ok(await tool(admin, "save_chart", {**args, "chart": chart, "dry_run": False}))
         saved["chart"] = created["uuid"]
-        assert created["action"] == "create" and created["url"].endswith(f"/saved/{created['uuid']}")
+        assert created["action"] == "create" and created["url"].endswith(
+            f"/saved/{created['uuid']}"
+        )
         assert created.get("validationErrors") == [], created
-        assert ok(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))["name"] == chart["name"]
+        assert (
+            ok(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))["name"]
+            == chart["name"]
+        )
 
-        created = ok(await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False}))
+        created = ok(
+            await tool(admin, "save_dashboard", {**args, "dashboard": dashboard, "dry_run": False})
+        )
         saved["dashboard"] = created["uuid"]
-        assert created["action"] == "create" and created["url"].endswith(f"/dashboards/{created['uuid']}")
+        assert created["action"] == "create" and created["url"].endswith(
+            f"/dashboards/{created['uuid']}"
+        )
         code = ok(await tool(admin, "get_dashboard_code", {**args, "slug": dashboard["slug"]}))
         assert [t["properties"]["chartSlug"] for t in code["tiles"]] == [chart["slug"]]
 
@@ -352,7 +483,9 @@ async def test_charts_and_dashboards_round_trip_as_code(admin, tool, project_uui
             delete = {**args, "content_type": content_type, "uuid": saved[content_type]}
             assert ok(await tool(admin, "delete_content", delete))["wouldDelete"]
             ok(await tool(admin, "delete_content", {**delete, "dry_run": False}))
-        assert "No chart with slug" in denied(await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]}))
+        assert "No chart with slug" in denied(
+            await tool(admin, "get_chart_code", {**args, "slug": chart["slug"]})
+        )
         assert leftovers() == []
     finally:
         for item in sorted(leftovers(), key=lambda c: c["contentType"] != "dashboard"):
@@ -368,6 +501,8 @@ async def test_tool_calls_are_logged(admin, tool, project_uuid, lightdash_admin,
     denied(await tool(admin, "list_spaces", {"project_uuid": other}))
     lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
     entries = [line for line in lines if line["event"] == "tool_call"]
-    assert len(entries) == 2 and all(e["tool"] == "list_spaces" and e["user"] == admin_uuid for e in entries)
+    assert len(entries) == 2 and all(
+        e["tool"] == "list_spaces" and e["user"] == admin_uuid for e in entries
+    )
     assert entries[0]["arguments"]["project_uuid"] == project_uuid and entries[0]["error"] is False
     assert entries[1]["arguments"]["project_uuid"] == other and entries[1]["error"] is True

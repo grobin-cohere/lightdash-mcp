@@ -46,20 +46,34 @@ class Settings(BaseSettings):
 
     def check(self) -> None:
         missing = [
-            name.upper() for name in ("lightdash_client_id", "lightdash_client_secret", "fernet_key") if not getattr(self, name)
+            name.upper()
+            for name in ("lightdash_client_id", "lightdash_client_secret", "fernet_key")
+            if not getattr(self, name)
         ]
         if missing:
             raise SystemExit(f"Missing settings: {', '.join(missing)}. See .env.example.")
 
         lightdash = urlsplit(self.lightdash_url)
         if lightdash.scheme not in ("http", "https") or not lightdash.hostname:
-            raise SystemExit(f"LIGHTDASH_URL must be an http or https address, not {self.lightdash_url!r}.")
+            raise SystemExit(
+                f"LIGHTDASH_URL must be an http or https address, not {self.lightdash_url!r}."
+            )
         public = urlsplit(self.public_url)
-        if public.scheme not in ("http", "https") or not public.hostname or public.path or public.query or public.fragment:
-            raise SystemExit(f"PUBLIC_URL must be an http or https address at the root of its host, not {self.public_url!r}.")
+        if (
+            public.scheme not in ("http", "https")
+            or not public.hostname
+            or public.path
+            or public.query
+            or public.fragment
+        ):
+            raise SystemExit(
+                f"PUBLIC_URL must be an http or https address at the root of its host, not {self.public_url!r}."
+            )
         # Browsers sign in and clients send their tokens there: only a loopback address may be plain HTTP.
         if public.scheme != "https" and public.hostname not in LOOPBACK_HOSTS:
-            raise SystemExit(f"PUBLIC_URL must be https unless its host is localhost, not {self.public_url!r}.")
+            raise SystemExit(
+                f"PUBLIC_URL must be https unless its host is localhost, not {self.public_url!r}."
+            )
         if public.scheme == "https" and self.host not in LOOPBACK_HOSTS:
             logger.warning(
                 "HOST=%s: the server also answers over plain HTTP on that address, around the HTTPS proxy at PUBLIC_URL. "

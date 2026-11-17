@@ -32,7 +32,10 @@ class LightdashClient:
     """
 
     def __init__(
-        self, http: httpx.AsyncClient, access_token: str, refresh: Callable[[str], Awaitable[str]] | None = None
+        self,
+        http: httpx.AsyncClient,
+        access_token: str,
+        refresh: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self._http = http
         self._token = access_token
@@ -57,4 +60,6 @@ class LightdashClient:
         return body.get("results") if isinstance(body, dict) and "results" in body else body
 
     async def get(self, path: str, **params: Any) -> Any:
-        return await self.request("GET", path, params={k: v for k, v in params.items() if v is not None})
+        return await self.request(
+            "GET", path, params={k: v for k, v in params.items() if v is not None}
+        )

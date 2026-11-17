@@ -43,12 +43,16 @@ TRANSACTION_TTL = 10 * 60
 CODE_TTL = 5 * 60
 ACCESS_TTL = 60 * 60
 REFRESH_TTL = 14 * 24 * 60 * 60  # Lightdash's refresh-token lifetime
-GRANT_LIFETIME = 90 * 24 * 60 * 60  # then the user signs in again, however often the client refreshes
+GRANT_LIFETIME = (
+    90 * 24 * 60 * 60
+)  # then the user signs in again, however often the client refreshes
 REFRESH_MARGIN = 60
 # A refresh ends while it still holds the grant's lock: under it, Redis takes the lock, reads the grant, saves the new
 # Lightdash tokens and writes the new tokens (or ends the grant: two commands too).
 REFRESH_TIMEOUT = LOCK_TIMEOUT - 4 * REDIS_COMMAND_TIMEOUT
-CLIENT_TTL = 30 * 24 * 60 * 60  # renewed on each token exchange: registration is open, so unused clients must expire
+CLIENT_TTL = (
+    30 * 24 * 60 * 60
+)  # renewed on each token exchange: registration is open, so unused clients must expire
 CONSENT_COOKIE = "lightdash_mcp_consent"  # one per transaction, suffixed with its digest
 FORM_LIMIT = 64 * 1024  # bytes of a form body: /token, /revoke and the consent page
 
@@ -143,7 +147,9 @@ def _consent_cookie(transaction_id: str) -> str:
 
 
 def _challenge(verifier: str) -> str:
-    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    )
 
 
 class LightdashOAuthProvider:
@@ -153,7 +159,9 @@ class LightdashOAuthProvider:
         # Shared by every user's Lightdash client, which set their own timeout. It keeps no cookies: one set
         # by a response to one user would go out with the next user's requests.
         self.http = httpx.AsyncClient(
-            base_url=settings.lightdash_url, timeout=30, cookies=CookieJar(DefaultCookiePolicy(allowed_domains=[]))
+            base_url=settings.lightdash_url,
+            timeout=30,
+            cookies=CookieJar(DefaultCookiePolicy(allowed_domains=[])),
         )
 
     # Client registration
@@ -163,10 +171,15 @@ class LightdashOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if len(client_info.client_name or "") > MAX_CLIENT_NAME:
-            raise RegistrationError("invalid_client_metadata", f"client_name is longer than {MAX_CLIENT_NAME} characters")
+            raise RegistrationError(
+                "invalid_client_metadata",
+                f"client_name is longer than {MAX_CLIENT_NAME} characters",
+            )
         redirect_uris = client_info.redirect_uris or []
         if len(redirect_uris) > MAX_REDIRECT_URIS:
-            raise RegistrationError("invalid_redirect_uri", f"At most {MAX_REDIRECT_URIS} redirect URIs")
+            raise RegistrationError(
+                "invalid_redirect_uri", f"At most {MAX_REDIRECT_URIS} redirect URIs"
+            )
         for uri in redirect_uris:
             if problem := self._redirect_problem(uri):
                 raise RegistrationError("invalid_redirect_uri", f"{clip(str(uri))}: {problem}")
@@ -191,7 +204,11 @@ class LightdashOAuthProvider:
             return "a redirect URI can't have a fragment"
         if uri.scheme == "http" and uri.host not in LOOPBACK_HOSTS:
             return "http is allowed for localhost, 127.0.0.1 and [::1] only: use https"
-        if uri.scheme == "https" and self.settings.redirect_hosts and uri.host not in self.settings.redirect_hosts:
+        if (
+            uri.scheme == "https"
+            and self.settings.redirect_hosts
+            and uri.host not in self.settings.redirect_hosts
+        ):
             return "this server accepts https redirect URIs on the hosts in REDIRECT_HOSTS only"
         if uri.scheme in BLOCKED_SCHEMES:
             return f"{uri.scheme}: URIs are not allowed"
@@ -199,18 +216,30 @@ class LightdashOAuthProvider:
 
     # Authorization: client -> consent page -> Lightdash -> callback -> client
 
-    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
         if not S256_CHALLENGE.match(params.code_challenge):
-            raise AuthorizeError("invalid_request", "code_challenge must be an S256 challenge: 43 base64url characters")
+            raise AuthorizeError(
+                "invalid_request",
+                "code_challenge must be an S256 challenge: 43 base64url characters",
+            )
         if len(params.state or "") > MAX_STATE or len(params.resource or "") > MAX_STATE:
-            raise AuthorizeError("invalid_request", f"state and resource are limited to {MAX_STATE} characters")
+            raise AuthorizeError(
+                "invalid_request", f"state and resource are limited to {MAX_STATE} characters"
+            )
         transaction_id = secrets.token_urlsafe(32)
         # The CSRF token is made once: a prefetch or a second tab of the consent page must not change it.
         transaction = Transaction(
-            client_id=client.client_id, params=params, verifier=secrets.token_urlsafe(48), csrf=secrets.token_urlsafe(32)
+            client_id=client.client_id,
+            params=params,
+            verifier=secrets.token_urlsafe(48),
+            csrf=secrets.token_urlsafe(32),
         )
         await self.store.put("transaction", transaction_id, transaction, TRANSACTION_TTL)
-        return f"{self.settings.public_url}/oauth/consent?{urlencode({'transaction': transaction_id})}"
+        return (
+            f"{self.settings.public_url}/oauth/consent?{urlencode({'transaction': transaction_id})}"
+        )
 
     async def consent_page(self, request: Request) -> Response:
         transaction_id = request.query_params.get("transaction", "")
@@ -256,7 +285,9 @@ class LightdashOAuthProvider:
     async def consent_submit(self, request: Request) -> Response:
         body = await read_body(request, FORM_LIMIT)
         if body is None:
-            return pages.page("Request too large", "<p>Start again from your MCP client.</p>", status=413)
+            return pages.page(
+                "Request too large", "<p>Start again from your MCP client.</p>", status=413
+            )
         form = dict(parse_qsl(body.decode("utf-8", "replace")))
         transaction_id = form.get("transaction", "")
         transaction = await self.store.get("transaction", transaction_id, Transaction)
@@ -272,7 +303,9 @@ class LightdashOAuthProvider:
         if not allowed:
             await self.store.delete("transaction", transaction_id)
             response = _redirect_to_client(transaction, error="access_denied")
-            response.delete_cookie(_consent_cookie(transaction_id), path="/oauth", secure=self._secure(request))
+            response.delete_cookie(
+                _consent_cookie(transaction_id), path="/oauth", secure=self._secure(request)
+            )
             return response
 
         transaction.approved = True
@@ -288,7 +321,9 @@ class LightdashOAuthProvider:
             "code_challenge_method": "S256",
         }
         # The consent cookie stays until the callback: it ties the sign-in to this browser.
-        return RedirectResponse(f"{self.settings.lightdash_url}/api/v1/oauth/authorize?{urlencode(query)}", 303)
+        return RedirectResponse(
+            f"{self.settings.lightdash_url}/api/v1/oauth/authorize?{urlencode(query)}", 303
+        )
 
     async def lightdash_callback(self, request: Request) -> Response:
         transaction_id = request.query_params.get("state", "")
@@ -303,18 +338,28 @@ class LightdashOAuthProvider:
         ):
             return pages.expired("Start again from your MCP client, in this browser.")
 
-        response = await self._finish_sign_in(transaction, request.query_params.get("code"), request.query_params.get("error"))
-        response.delete_cookie(_consent_cookie(transaction_id), path="/oauth", secure=self._secure(request))
+        response = await self._finish_sign_in(
+            transaction, request.query_params.get("code"), request.query_params.get("error")
+        )
+        response.delete_cookie(
+            _consent_cookie(transaction_id), path="/oauth", secure=self._secure(request)
+        )
         return response
 
-    async def _finish_sign_in(self, transaction: Transaction, code: str | None, error: str | None) -> Response:
+    async def _finish_sign_in(
+        self, transaction: Transaction, code: str | None, error: str | None
+    ) -> Response:
         if error or not code:
-            return _redirect_to_client(transaction, error=error if error in FORWARDED_ERRORS else "server_error")
+            return _redirect_to_client(
+                transaction, error=error if error in FORWARDED_ERRORS else "server_error"
+            )
         try:
             grant = await self._sign_in_to_lightdash(transaction, code)
         except httpx.HTTPError, ValueError, KeyError, TypeError:
             record("sign_in_failed", logging.WARNING, client_id=transaction.client_id)
-            return _redirect_to_client(transaction, error="server_error", description="Lightdash sign-in failed")
+            return _redirect_to_client(
+                transaction, error="server_error", description="Lightdash sign-in failed"
+            )
 
         grant_id, code = secrets.token_urlsafe(16), secrets.token_urlsafe(32)
         grant.code_digest = digest(code)
@@ -343,7 +388,9 @@ class LightdashOAuthProvider:
             ]
         )
         record("grant_created", grant=grant_id, subject=grant.subject, client_id=grant.client_id)
-        return RedirectResponse(construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state), 302)
+        return RedirectResponse(
+            construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state), 302
+        )
 
     async def _sign_in_to_lightdash(self, transaction: Transaction, code: str) -> Grant:
         response = await self.http.post(
@@ -359,7 +406,9 @@ class LightdashOAuthProvider:
         )
         response.raise_for_status()
         tokens = LightdashTokens.model_validate_json(response.content)
-        user = await self.http.get("/api/v1/user", headers={"Authorization": f"Bearer {tokens.access_token}"})
+        user = await self.http.get(
+            "/api/v1/user", headers={"Authorization": f"Bearer {tokens.access_token}"}
+        )
         user.raise_for_status()
         return Grant(
             client_id=transaction.client_id,
@@ -371,14 +420,28 @@ class LightdashOAuthProvider:
 
     # Tokens. Each one is valid only while its grant points back to it, so a record copied in Redis is refused.
 
-    async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str) -> Code | None:
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> Code | None:
         code = await self.store.get("code", digest(authorization_code), Code)
-        if not code or not _same(code.code, authorization_code) or code.client_id != client.client_id:
+        if (
+            not code
+            or not _same(code.code, authorization_code)
+            or code.client_id != client.client_id
+        ):
             return None
         grant = await self.store.get("grant", code.grant_id, Grant)
-        return code if grant and grant.code_digest == digest(authorization_code) and grant.client_id == client.client_id else None
+        return (
+            code
+            if grant
+            and grant.code_digest == digest(authorization_code)
+            and grant.client_id == client.client_id
+            else None
+        )
 
-    async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code: Code) -> OAuthToken:
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: Code
+    ) -> OAuthToken:
         grant_id = authorization_code.grant_id
         try:
             async with self.store.lock("grant", grant_id):
@@ -387,19 +450,29 @@ class LightdashOAuthProvider:
                 grant = await self.store.get("grant", grant_id, Grant)
                 if not grant or grant.code_digest != digest(authorization_code.code):
                     raise TokenError("invalid_grant", "Sign-in ended")
-                tokens = await self._issue(grant_id, grant, authorization_code.scopes, authorization_code.resource)
+                tokens = await self._issue(
+                    grant_id, grant, authorization_code.scopes, authorization_code.resource
+                )
         except LockError:
             # Only taking the lock raises it (Store.lock), so nothing under it has run: the code isn't used yet.
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self._renew_client(client)
         return tokens
 
-    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> Refresh | None:
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> Refresh | None:
         token_digest = digest(refresh_token)
         token = await self.store.get("refresh", token_digest, Refresh)
         if token and _same(token.token, refresh_token) and token.client_id == client.client_id:
             grant = await self.store.get("grant", token.grant_id, Grant)
-            return token if grant and grant.refresh_digest == token_digest and grant.client_id == client.client_id else None
+            return (
+                token
+                if grant
+                and grant.refresh_digest == token_digest
+                and grant.client_id == client.client_id
+                else None
+            )
         rotated = await self.store.get("rotated", token_digest, Rotated)
         if rotated and rotated.client_id == client.client_id:
             # A refresh token works once: seen again after its exchange, it was copied. End the sign-in for every copy.
@@ -424,7 +497,9 @@ class LightdashOAuthProvider:
                     raise TokenError("invalid_grant", "Lightdash sign-in ended") from None
                 except RefreshFailed as error:
                     raise TokenError(RETRY_ERROR, str(error)) from None
-                tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
+                tokens = await self._issue(
+                    grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource
+                )
         except LockError:
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self._renew_client(client)
@@ -439,23 +514,49 @@ class LightdashOAuthProvider:
 
     async def load_access_token(self, token: str) -> Access | None:
         access = await self.store.get("access", digest(token), Access)
-        if not access or not _same(access.token, token) or (access.expires_at and access.expires_at < time.time()):
+        if (
+            not access
+            or not _same(access.token, token)
+            or (access.expires_at and access.expires_at < time.time())
+        ):
             return None
         grant = await self.store.get("grant", access.grant_id, Grant)
-        return access if grant and grant.access_digest == digest(token) and grant.client_id == access.client_id else None
+        return (
+            access
+            if grant
+            and grant.access_digest == digest(token)
+            and grant.client_id == access.client_id
+            else None
+        )
 
     async def revoke_token(self, token: Access | Refresh) -> None:
         try:
             await self.end_grant(token.grant_id, "revoked", revoke_upstream=True, revoked=token)
         except LockError:  # only taking the lock raises it (Store.lock): nothing is revoked
-            record("revoke_busy", logging.WARNING, grant=token.grant_id, subject=token.subject, client_id=token.client_id)
+            record(
+                "revoke_busy",
+                logging.WARNING,
+                grant=token.grant_id,
+                subject=token.subject,
+                client_id=token.client_id,
+            )
             raise
 
-    async def _issue(self, grant_id: str, grant: Grant, scopes: list[str], resource: str | None) -> OAuthToken:
+    async def _issue(
+        self, grant_id: str, grant: Grant, scopes: list[str], resource: str | None
+    ) -> OAuthToken:
         """New tokens for the grant, written with it in one step. The caller holds the grant's lock."""
         access, refresh = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        common = {"client_id": grant.client_id, "scopes": scopes, "resource": resource, "subject": grant.subject}
-        access_ttl, refresh_ttl = _grant_ttl(grant, self.settings.access_token_ttl), _grant_ttl(grant)
+        common = {
+            "client_id": grant.client_id,
+            "scopes": scopes,
+            "resource": resource,
+            "subject": grant.subject,
+        }
+        access_ttl, refresh_ttl = (
+            _grant_ttl(grant, self.settings.access_token_ttl),
+            _grant_ttl(grant),
+        )
         now = int(time.time())
         put: list[tuple[str, str, BaseModel, int]] = [
             (
@@ -472,7 +573,14 @@ class LightdashOAuthProvider:
             ),
         ]
         if grant.refresh_digest:
-            put.append(("rotated", grant.refresh_digest, Rotated(client_id=grant.client_id, grant_id=grant_id), REFRESH_TTL))
+            put.append(
+                (
+                    "rotated",
+                    grant.refresh_digest,
+                    Rotated(client_id=grant.client_id, grant_id=grant_id),
+                    REFRESH_TTL,
+                )
+            )
         delete = [("access", grant.access_digest), ("refresh", grant.refresh_digest)]
         grant.access_digest, grant.refresh_digest = digest(access), digest(refresh)
         put.append(("grant", grant_id, grant, refresh_ttl))
@@ -524,19 +632,29 @@ class LightdashOAuthProvider:
                     },
                 )
         except TimeoutError:
-            raise self._refresh_failed(grant_id, grant, "Lightdash didn't answer in time while refreshing your sign-in") from None
+            raise self._refresh_failed(
+                grant_id, grant, "Lightdash didn't answer in time while refreshing your sign-in"
+            ) from None
         except httpx.HTTPError:
-            raise self._refresh_failed(grant_id, grant, "Couldn't reach Lightdash to refresh your sign-in") from None
+            raise self._refresh_failed(
+                grant_id, grant, "Couldn't reach Lightdash to refresh your sign-in"
+            ) from None
         # Only a refused grant ends the sign-in. Other errors, such as invalid_client, are the server's.
         if response.status_code in (400, 401) and _oauth_error(response) == "invalid_grant":
             await self._end_grant(grant_id, "lightdash_refused_refresh")
             raise SignInRequired
         if not response.is_success:
-            raise self._refresh_failed(grant_id, grant, f"Lightdash error {response.status_code} while refreshing your sign-in")
+            raise self._refresh_failed(
+                grant_id,
+                grant,
+                f"Lightdash error {response.status_code} while refreshing your sign-in",
+            )
         try:
             tokens = LightdashTokens.model_validate_json(response.content)
         except ValueError:
-            raise self._refresh_failed(grant_id, grant, "Lightdash answered the refresh of your sign-in with no token") from None
+            raise self._refresh_failed(
+                grant_id, grant, "Lightdash answered the refresh of your sign-in with no token"
+            ) from None
 
         grant.access_token, grant.refresh_token = tokens.access_token, tokens.refresh_token
         grant.expires_at = time.time() + tokens.expires_in
@@ -545,11 +663,22 @@ class LightdashOAuthProvider:
         return grant.access_token
 
     def _refresh_failed(self, grant_id: str, grant: Grant, reason: str) -> RefreshFailed:
-        record("refresh_failed", logging.WARNING, grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
+        record(
+            "refresh_failed",
+            logging.WARNING,
+            grant=grant_id,
+            subject=grant.subject,
+            client_id=grant.client_id,
+            reason=reason,
+        )
         return RefreshFailed(f"{reason}. Try again in a moment.")
 
     async def end_grant(
-        self, grant_id: str, reason: str, revoke_upstream: bool = False, revoked: Access | Refresh | None = None
+        self,
+        grant_id: str,
+        reason: str,
+        revoke_upstream: bool = False,
+        revoked: Access | Refresh | None = None,
     ) -> None:
         # Under the grant's lock, so a refresh or token exchange in flight can't put the grant back.
         async with self.store.lock("grant", grant_id):
@@ -557,21 +686,38 @@ class LightdashOAuthProvider:
         if grant and revoke_upstream:
             await self._revoke_upstream(grant_id, grant)
 
-    async def _end_grant(self, grant_id: str, reason: str, revoked: Access | Refresh | None = None) -> Grant | None:
+    async def _end_grant(
+        self, grant_id: str, reason: str, revoked: Access | Refresh | None = None
+    ) -> Grant | None:
         """Ends the grant and its tokens in one step, so a Redis failure leaves the grant whole or ended, and logs the
         `revoked` token that ends it. The caller holds the grant's lock."""
         grant = await self.store.get("grant", grant_id, Grant)
         if not grant:
             return None
         ended, *_ = await self.store.write(
-            delete=[("grant", grant_id), ("access", grant.access_digest), ("refresh", grant.refresh_digest)]
+            delete=[
+                ("grant", grant_id),
+                ("access", grant.access_digest),
+                ("refresh", grant.refresh_digest),
+            ]
         )
         if not ended:
             return None  # ended meanwhile, by a request that took the lock once it expired
         if revoked:
             # Logged once its grant is gone, from then on the token no longer loads, and only by the request that ended it.
-            record("token_revoked", grant=grant_id, subject=revoked.subject, client_id=revoked.client_id)
-        record("grant_ended", grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
+            record(
+                "token_revoked",
+                grant=grant_id,
+                subject=revoked.subject,
+                client_id=revoked.client_id,
+            )
+        record(
+            "grant_ended",
+            grant=grant_id,
+            subject=grant.subject,
+            client_id=grant.client_id,
+            reason=reason,
+        )
         return grant
 
     async def _revoke_upstream(self, grant_id: str, grant: Grant) -> None:
@@ -592,7 +738,13 @@ class LightdashOAuthProvider:
             if response.is_success:
                 return
             failure = response.status_code
-        record("lightdash_revoke_failed", logging.WARNING, grant=grant_id, subject=grant.subject, failure=failure)
+        record(
+            "lightdash_revoke_failed",
+            logging.WARNING,
+            grant=grant_id,
+            subject=grant.subject,
+            failure=failure,
+        )
 
 
 async def read_body(request: Request, limit: int) -> bytes | None:
@@ -631,8 +783,13 @@ def _oauth_error(response: httpx.Response) -> str | None:
     return body.get("error") if isinstance(body, dict) else None
 
 
-def _redirect_to_client(transaction: Transaction, error: str, description: str | None = None) -> Response:
+def _redirect_to_client(
+    transaction: Transaction, error: str, description: str | None = None
+) -> Response:
     url = construct_redirect_uri(
-        str(transaction.params.redirect_uri), error=error, error_description=description, state=transaction.params.state
+        str(transaction.params.redirect_uri),
+        error=error,
+        error_description=description,
+        state=transaction.params.state,
     )
     return RedirectResponse(url, 302)

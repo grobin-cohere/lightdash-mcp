@@ -22,15 +22,33 @@ async def project_access(ld: LightdashClient, project_uuid: str) -> dict[str, An
     """Each user with access to the project and their effective role: the highest of their organization role,
     their direct grant and the roles of their groups. Custom roles can't be ranked, so they are listed apart."""
     users = await _users(ld)
-    direct = {m["userUuid"]: m.get("roleUuid") or m["role"] for m in await ld.get(f"/api/v1/projects/{project_uuid}/access")}
-    group_roles = {g["groupUuid"]: g["role"] for g in await ld.get(f"/api/v1/projects/{project_uuid}/groupAccesses")}
-    group_names = {g["uuid"]: g["name"] for g in await every_page(ld, "/api/v1/org/groups")} if group_roles else {}
+    direct = {
+        m["userUuid"]: m.get("roleUuid") or m["role"]
+        for m in await ld.get(f"/api/v1/projects/{project_uuid}/access")
+    }
+    group_roles = {
+        g["groupUuid"]: g["role"]
+        for g in await ld.get(f"/api/v1/projects/{project_uuid}/groupAccesses")
+    }
+    group_names = (
+        {g["uuid"]: g["name"] for g in await every_page(ld, "/api/v1/org/groups")}
+        if group_roles
+        else {}
+    )
     listed = []
     for u in users:
         groups = [g for g in u.get("groups") or [] if g["uuid"] in group_roles]
         # An organization member without a project role has no access to the project.
         organization_role = u.get("role") if u.get("role") != "member" else None
-        roles = {r for r in (organization_role, direct.get(u["userUuid"]), *(group_roles[g["uuid"]] for g in groups)) if r}
+        roles = {
+            r
+            for r in (
+                organization_role,
+                direct.get(u["userUuid"]),
+                *(group_roles[g["uuid"]] for g in groups),
+            )
+            if r
+        }
         if not roles:
             continue
         custom = sorted(roles.difference(RANKS))
@@ -48,7 +66,10 @@ async def project_access(ld: LightdashClient, project_uuid: str) -> dict[str, An
         )
     return {
         "users": listed,
-        "groups": [{"groupUuid": uuid, "name": group_names.get(uuid), "projectRole": role} for uuid, role in group_roles.items()],
+        "groups": [
+            {"groupUuid": uuid, "name": group_names.get(uuid), "projectRole": role}
+            for uuid, role in group_roles.items()
+        ],
     }
 
 
@@ -61,7 +82,9 @@ async def roles(ld: LightdashClient, organization_uuid: str) -> list[dict[str, A
         if error.status != 403:
             raise
         found = await ld.get(path)
-    return [pick(r, "roleUuid", "name", "description", "ownerType", "level", "scopes") for r in found]
+    return [
+        pick(r, "roleUuid", "name", "description", "ownerType", "level", "scopes") for r in found
+    ]
 
 
 async def _current(
@@ -73,13 +96,16 @@ async def _current(
         (
             pick(u, "projectRole", "organizationRole", "directRole", "groups")
             for u in users
-            if u["userUuid"] == user_uuid or (email is not None and (u["email"] or "").lower() == email.lower())
+            if u["userUuid"] == user_uuid
+            or (email is not None and (u["email"] or "").lower() == email.lower())
         ),
         None,
     )
 
 
-async def grant(ld: LightdashClient, project_uuid: str, email: str, role: str, dry_run: bool) -> dict[str, Any]:
+async def grant(
+    ld: LightdashClient, project_uuid: str, email: str, role: str, dry_run: bool
+) -> dict[str, Any]:
     access = {"email": email, "role": role}
     if dry_run:
         return {
@@ -87,29 +113,47 @@ async def grant(ld: LightdashClient, project_uuid: str, email: str, role: str, d
             "currentAccess": await _current(ld, project_uuid, email=email),
             "next": "Nothing is changed yet. Call grant_project_access again with dry_run=false to grant it.",
         }
-    await ld.request("POST", f"/api/v1/projects/{project_uuid}/access", json=access | {"sendEmail": False})
+    await ld.request(
+        "POST", f"/api/v1/projects/{project_uuid}/access", json=access | {"sendEmail": False}
+    )
     return {"granted": access}
 
 
-async def update_grant(ld: LightdashClient, project_uuid: str, user_uuid: str, role: str, dry_run: bool) -> dict[str, Any]:
+async def update_grant(
+    ld: LightdashClient, project_uuid: str, user_uuid: str, role: str, dry_run: bool
+) -> dict[str, Any]:
     members = await ld.get(f"/api/v1/projects/{project_uuid}/access")
     member = next((m for m in members if m["userUuid"] == user_uuid), None)
     if member is None:
-        return {"changed": None, "message": "This user has no direct grant on the project: use grant_project_access."}
-    change = {"userUuid": user_uuid, "email": member.get("email"), "from": member.get("role"), "to": role}
+        return {
+            "changed": None,
+            "message": "This user has no direct grant on the project: use grant_project_access.",
+        }
+    change = {
+        "userUuid": user_uuid,
+        "email": member.get("email"),
+        "from": member.get("role"),
+        "to": role,
+    }
     if dry_run:
         return {
             "wouldChange": change,
             "currentAccess": await _current(ld, project_uuid, user_uuid=user_uuid),
             "next": "Nothing is changed yet. Call update_project_access again with dry_run=false to change it.",
         }
-    await ld.request("PATCH", f"/api/v1/projects/{project_uuid}/access/{user_uuid}", json={"role": role})
+    await ld.request(
+        "PATCH", f"/api/v1/projects/{project_uuid}/access/{user_uuid}", json={"role": role}
+    )
     return {"changed": change}
 
 
-async def add_member(ld: LightdashClient, group_uuid: str, user_uuid: str, dry_run: bool) -> dict[str, Any]:
+async def add_member(
+    ld: LightdashClient, group_uuid: str, user_uuid: str, dry_run: bool
+) -> dict[str, Any]:
     group = await ld.get(f"/api/v1/groups/{group_uuid}")
-    if any(m["userUuid"] == user_uuid for m in await ld.get(f"/api/v1/groups/{group_uuid}/members")):
+    if any(
+        m["userUuid"] == user_uuid for m in await ld.get(f"/api/v1/groups/{group_uuid}/members")
+    ):
         return {"added": None, "message": "This user is already a member of the group."}
     membership = {"userUuid": user_uuid, "group": group["name"]}
     if dry_run:
@@ -117,7 +161,11 @@ async def add_member(ld: LightdashClient, group_uuid: str, user_uuid: str, dry_r
         for project in await ld.get("/api/v1/org/projects"):
             accesses = await ld.get(f"/api/v1/projects/{project['projectUuid']}/groupAccesses")
             gives += [
-                {"projectUuid": project["projectUuid"], "project": project["name"], "role": a["role"]}
+                {
+                    "projectUuid": project["projectUuid"],
+                    "project": project["name"],
+                    "role": a["role"],
+                }
                 for a in accesses
                 if a["groupUuid"] == group_uuid
             ]
@@ -135,7 +183,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def list_projects() -> list[dict[str, Any]]:
         """List the Lightdash projects you can see. Most tools need a project UUID from here."""
         async with lightdash(provider) as ld:
-            return [pick(p, "projectUuid", "name", "type") for p in await ld.get("/api/v1/org/projects")]
+            return [
+                pick(p, "projectUuid", "name", "type") for p in await ld.get("/api/v1/org/projects")
+            ]
 
     @server.tool(annotations=READ)
     async def list_users(search: str | None = None) -> list[dict[str, Any]]:
@@ -159,13 +209,16 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def list_groups(search: str | None = None) -> list[dict[str, Any]]:
         """List groups and their members."""
         async with lightdash(provider) as ld:
-            groups = await every_page(ld, "/api/v1/org/groups", searchQuery=search, includeMembers=1000)
+            groups = await every_page(
+                ld, "/api/v1/org/groups", searchQuery=search, includeMembers=1000
+            )
         return [
             {
                 "groupUuid": g["uuid"],
                 "name": g["name"],
                 "members": [
-                    {"userUuid": m["userUuid"], "name": full_name(m), "email": m.get("email")} for m in g.get("members") or []
+                    {"userUuid": m["userUuid"], "name": full_name(m), "email": m.get("email")}
+                    for m in g.get("members") or []
                 ],
             }
             for g in groups
@@ -227,11 +280,16 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 }
                 for a in space.get("access") or []
             ],
-            "groups": [pick(g, "groupUuid", "groupName", "spaceRole") for g in space.get("groupsAccess") or []],
+            "groups": [
+                pick(g, "groupUuid", "groupName", "spaceRole")
+                for g in space.get("groupsAccess") or []
+            ],
         }
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def grant_project_access(project_uuid: Uuid, email: str, role: ProjectRole, dry_run: bool = True) -> dict[str, Any]:
+    async def grant_project_access(
+        project_uuid: Uuid, email: str, role: ProjectRole, dry_run: bool = True
+    ) -> dict[str, Any]:
         """Give an organization member direct access to a project, without an email. Fails if they already have
         a direct grant, as Lightdash refuses a second one: use update_project_access to change it.
         dry_run, on by default, shows their current access and the grant. Pass dry_run=false to grant it."""
@@ -248,7 +306,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             return await update_grant(ld, project_uuid, user_uuid, role, dry_run)
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def revoke_project_access(project_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:
+    async def revoke_project_access(
+        project_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True
+    ) -> dict[str, Any]:
         """Remove a user's direct project grant. Access through their organization role or a group remains.
         dry_run, on by default, shows the grant that would be removed. Pass dry_run=false to remove it."""
         async with lightdash(provider) as ld:
@@ -256,21 +316,29 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             member = next((m for m in members if m["userUuid"] == user_uuid), None)
             if member is None:
                 return {"removed": None, "message": "This user has no direct grant on the project."}
-            grant = {"userUuid": user_uuid, "email": member.get("email"), "role": member.get("role")}
+            grant = {
+                "userUuid": user_uuid,
+                "email": member.get("email"),
+                "role": member.get("role"),
+            }
             if dry_run:
                 return {"wouldRemove": grant}
             await ld.request("DELETE", f"/api/v1/projects/{project_uuid}/access/{user_uuid}")
         return {"removed": grant}
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def add_group_member(group_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:
+    async def add_group_member(
+        group_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True
+    ) -> dict[str, Any]:
         """Add a user to a group, and with it the project access the group gives.
         dry_run, on by default, shows the group and the projects it gives access to. Pass dry_run=false to add them."""
         async with lightdash(provider) as ld:
             return await add_member(ld, group_uuid, user_uuid, dry_run)
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def remove_group_member(group_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:
+    async def remove_group_member(
+        group_uuid: Uuid, user_uuid: Uuid, dry_run: bool = True
+    ) -> dict[str, Any]:
         """Remove a user from a group, and with it any access the group gave them.
         dry_run, on by default, checks the membership. Pass dry_run=false to remove it."""
         async with lightdash(provider) as ld:

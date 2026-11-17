@@ -21,10 +21,14 @@ async def _content(ld: LightdashClient, project_uuid: str, **params: Any) -> lis
     return await every_page(ld, "/api/v2/content", projectUuids=project_uuid, **params)
 
 
-async def _item(ld: LightdashClient, project_uuid: str, content_type: ContentType, uuid: str) -> dict[str, Any]:
+async def _item(
+    ld: LightdashClient, project_uuid: str, content_type: ContentType, uuid: str
+) -> dict[str, Any]:
     # Check the UUID rather than trust the filter: deleting the wrong space deletes everything in it.
     items = await _content(ld, project_uuid, uuids=uuid, contentTypes=content_type)
-    item = next((i for i in items if i["uuid"] == uuid.lower() and i["contentType"] == content_type), None)
+    item = next(
+        (i for i in items if i["uuid"] == uuid.lower() and i["contentType"] == content_type), None
+    )
     if item is None:
         raise ToolError(f"No {content_type} {uuid} in this project.")
     return item
@@ -62,7 +66,9 @@ def unused_content(items: list[dict[str, Any]], unused_days: int) -> list[dict[s
         # doesn't mean never viewed.
         return not item.get("views")
 
-    found = sorted(filter(unused, items), key=lambda i: (i.get("lastViewedAt") or "", i["createdAt"]))
+    found = sorted(
+        filter(unused, items), key=lambda i: (i.get("lastViewedAt") or "", i["createdAt"])
+    )
     return [
         {
             **_summary(i),
@@ -77,7 +83,10 @@ def unused_content(items: list[dict[str, Any]], unused_days: int) -> list[dict[s
 
 def _tile(tile: dict[str, Any], tabs: dict[str, str]) -> dict[str, Any]:
     properties = tile["properties"]
-    summary = {"type": tile["type"], "title": properties.get("title") or properties.get("chartName")}
+    summary = {
+        "type": tile["type"],
+        "title": properties.get("title") or properties.get("chartName"),
+    }
     if tabs:
         summary["tab"] = tabs.get(tile.get("tabUuid"))
     if tile["type"] == "saved_chart":
@@ -94,14 +103,23 @@ def _tile(tile: dict[str, Any], tabs: dict[str, str]) -> dict[str, Any]:
 def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     @server.tool(annotations=READ)
     async def search_content(
-        project_uuid: Uuid, search: str | None = None, content_type: Literal["chart", "dashboard"] | None = None
+        project_uuid: Uuid,
+        search: str | None = None,
+        content_type: Literal["chart", "dashboard"] | None = None,
     ) -> list[dict[str, Any]]:
         """Find charts and dashboards by name, or list them all without search.
         Run a chart with run_chart, and open a dashboard with get_dashboard."""
         async with lightdash(provider) as ld:
-            items = await _content(ld, project_uuid, search=search, contentTypes=content_type or ["chart", "dashboard"])
+            items = await _content(
+                ld, project_uuid, search=search, contentTypes=content_type or ["chart", "dashboard"]
+            )
         return [
-            {**_summary(i), "description": i.get("description"), "views": i.get("views"), "lastUpdatedAt": i.get("lastUpdatedAt")}
+            {
+                **_summary(i),
+                "description": i.get("description"),
+                "views": i.get("views"),
+                "lastUpdatedAt": i.get("lastUpdatedAt"),
+            }
             for i in items
         ]
 
@@ -112,8 +130,13 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         async with lightdash(provider) as ld:
             dashboard = await ld.get(f"/api/v1/dashboards/{dashboard_uuid}")
         tabs = sorted(dashboard.get("tabs") or [], key=lambda t: t["order"])
-        names, order = {t["uuid"]: t["name"] for t in tabs}, {t["uuid"]: n for n, t in enumerate(tabs)}
-        tiles = sorted(dashboard["tiles"], key=lambda t: (order.get(t.get("tabUuid"), 0), t["y"], t["x"]))
+        names, order = (
+            {t["uuid"]: t["name"] for t in tabs},
+            {t["uuid"]: n for n, t in enumerate(tabs)},
+        )
+        tiles = sorted(
+            dashboard["tiles"], key=lambda t: (order.get(t.get("tabUuid"), 0), t["y"], t["x"])
+        )
         filters = dashboard.get("filters") or {}
         return {
             "name": dashboard["name"],
@@ -135,24 +158,32 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
 
     @server.tool(annotations=READ)
     async def find_unused_content(
-        project_uuid: Uuid, unused_days: int = 90, content_type: Literal["chart", "dashboard"] | None = None
+        project_uuid: Uuid,
+        unused_days: int = 90,
+        content_type: Literal["chart", "dashboard"] | None = None,
     ) -> list[dict[str, Any]]:
         """Find charts and dashboards nobody has viewed in `unused_days` days, never-viewed first.
         Content created within that window is left out, and so is viewed content whose last view date
         Lightdash doesn't record."""
         async with lightdash(provider) as ld:
-            items = await _content(ld, project_uuid, contentTypes=content_type or ["chart", "dashboard"])
+            items = await _content(
+                ld, project_uuid, contentTypes=content_type or ["chart", "dashboard"]
+            )
         return unused_content(items, unused_days)
 
     @server.tool(annotations=READ)
-    async def list_validation_errors(project_uuid: Uuid, revalidate: bool = False) -> list[dict[str, Any]]:
+    async def list_validation_errors(
+        project_uuid: Uuid, revalidate: bool = False
+    ) -> list[dict[str, Any]]:
         """List broken charts and dashboards: fields that no longer exist, bad configurations.
         Results come from the last validation run; set revalidate to run a fresh one first."""
         async with lightdash(provider) as ld:
             if revalidate:
                 job = await ld.request("POST", f"/api/v1/projects/{project_uuid}/validate")
                 for _ in range(VALIDATION_TIMEOUT):
-                    status = (await ld.get(f"/api/v1/schedulers/job/{job['jobId']}/status"))["status"]
+                    status = (await ld.get(f"/api/v1/schedulers/job/{job['jobId']}/status"))[
+                        "status"
+                    ]
                     if status in ("completed", "error"):
                         break
                     await asyncio.sleep(1)
@@ -174,19 +205,26 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         ]
 
     @server.tool(annotations=WRITE)
-    async def move_content(project_uuid: Uuid, content_type: ContentType, uuid: Uuid, target_space_uuid: Uuid) -> str:
+    async def move_content(
+        project_uuid: Uuid, content_type: ContentType, uuid: Uuid, target_space_uuid: Uuid
+    ) -> str:
         """Move a chart, dashboard or space into another space."""
         async with lightdash(provider) as ld:
             item = await _item(ld, project_uuid, content_type, uuid)
             await ld.request(
                 "POST",
                 f"/api/v2/content/{project_uuid}/move",
-                json={"item": _payload(item), "action": {"type": "move", "targetSpaceUuid": target_space_uuid}},
+                json={
+                    "item": _payload(item),
+                    "action": {"type": "move", "targetSpaceUuid": target_space_uuid},
+                },
             )
         return f'Moved {content_type} "{item["name"]}".'
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def delete_content(project_uuid: Uuid, content_type: ContentType, uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:
+    async def delete_content(
+        project_uuid: Uuid, content_type: ContentType, uuid: Uuid, dry_run: bool = True
+    ) -> dict[str, Any]:
         """Delete a chart, dashboard or space. A space is deleted with everything in it.
         dry_run, on by default, shows what would be deleted. Pass dry_run=false to delete."""
         async with lightdash(provider) as ld:
@@ -194,10 +232,16 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             impact: dict[str, Any] = {"item": _summary(item)}
             if content_type == "space":
                 found = await ld.get(f"/api/v1/projects/{project_uuid}/spaces/{uuid}/delete-impact")
-                impact["includes"] = {k: [c.get("name") for c in v] for k, v in found.items() if isinstance(v, list) and v}
+                impact["includes"] = {
+                    k: [c.get("name") for c in v]
+                    for k, v in found.items()
+                    if isinstance(v, list) and v
+                }
             if dry_run:
                 return {"wouldDelete": impact}
             await ld.request(
-                "POST", f"/api/v2/content/{project_uuid}/delete", json={"item": _payload(item), "action": {"type": "delete"}}
+                "POST",
+                f"/api/v2/content/{project_uuid}/delete",
+                json={"item": _payload(item), "action": {"type": "delete"}},
             )
         return {"deleted": impact}

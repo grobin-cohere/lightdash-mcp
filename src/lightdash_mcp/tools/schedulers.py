@@ -10,7 +10,9 @@ from lightdash_mcp.tools.common import DESTRUCTIVE, READ, WRITE, Uuid, lightdash
 from lightdash_mcp.tools.shared import every_page
 
 
-async def update(ld: LightdashClient, scheduler_uuid: str, changes: dict[str, Any]) -> dict[str, Any]:
+async def update(
+    ld: LightdashClient, scheduler_uuid: str, changes: dict[str, Any]
+) -> dict[str, Any]:
     # PATCH writes every column, so a field left out becomes null (SchedulerModel.updateScheduler):
     # send the whole scheduler back with the changes. Lightdash ignores the read-only fields.
     current = await ld.get(f"/api/v1/schedulers/{scheduler_uuid}")
@@ -25,20 +27,30 @@ def _summary(s: dict[str, Any]) -> dict[str, Any]:
         "cron": s.get("cron"),
         "timezone": s.get("timezone"),
         "format": s.get("format"),
-        "content": s.get("savedChartName") or s.get("dashboardName") or s.get("savedSqlName") or s.get("appName"),
+        "content": s.get("savedChartName")
+        or s.get("dashboardName")
+        or s.get("savedSqlName")
+        or s.get("appName"),
         "owner": s.get("createdByName"),
-        "recipients": [t.get("recipient") or t.get("channel") or t.get("url") for t in s.get("targets") or []],
+        "recipients": [
+            t.get("recipient") or t.get("channel") or t.get("url") for t in s.get("targets") or []
+        ],
         "latestRun": s.get("latestRun"),
     }
 
 
 def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     @server.tool(annotations=READ)
-    async def list_schedulers(project_uuid: Uuid, search: str | None = None) -> list[dict[str, Any]]:
+    async def list_schedulers(
+        project_uuid: Uuid, search: str | None = None
+    ) -> list[dict[str, Any]]:
         """List a project's scheduled deliveries with their schedule, owner, recipients and latest run."""
         async with lightdash(provider) as ld:
             schedulers = await every_page(
-                ld, f"/api/v1/schedulers/{project_uuid}/list", searchQuery=search, includeLatestRun="true"
+                ld,
+                f"/api/v1/schedulers/{project_uuid}/list",
+                searchQuery=search,
+                includeLatestRun="true",
             )
         return [_summary(s) for s in schedulers]
 
@@ -46,7 +58,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def set_scheduler_enabled(scheduler_uuid: Uuid, enabled: bool) -> str:
         """Pause (enabled=false) or resume (enabled=true) a scheduled delivery."""
         async with lightdash(provider) as ld:
-            await ld.request("PATCH", f"/api/v1/schedulers/{scheduler_uuid}/enabled", json={"enabled": enabled})
+            await ld.request(
+                "PATCH", f"/api/v1/schedulers/{scheduler_uuid}/enabled", json={"enabled": enabled}
+            )
         return "Resumed the delivery." if enabled else "Paused the delivery."
 
     @server.tool(annotations=WRITE)
@@ -60,7 +74,14 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """Change a scheduled delivery's name, schedule (cron expression), timezone or message.
         Fields left out stay as they are."""
         changes = {
-            k: v for k, v in {"name": name, "cron": cron, "timezone": timezone, "message": message}.items() if v is not None
+            k: v
+            for k, v in {
+                "name": name,
+                "cron": cron,
+                "timezone": timezone,
+                "message": message,
+            }.items()
+            if v is not None
         }
         async with lightdash(provider) as ld:
             return _summary(await update(ld, scheduler_uuid, changes))

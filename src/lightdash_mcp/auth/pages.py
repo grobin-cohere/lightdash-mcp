@@ -5,7 +5,9 @@ import html
 from starlette.responses import HTMLResponse
 
 
-def consent(client_name: str, redirect_uri: str, warning: str | None, transaction_id: str, csrf: str) -> HTMLResponse:
+def consent(
+    client_name: str, redirect_uri: str, warning: str | None, transaction_id: str, csrf: str
+) -> HTMLResponse:
     notice = f'<p class="warning">{html.escape(warning)}</p>' if warning else ""
     body = f"""
             <p><strong>{html.escape(client_name)}</strong> wants to use Lightdash as you.</p>

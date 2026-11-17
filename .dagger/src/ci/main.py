@@ -48,7 +48,13 @@ class Ci:
             dag.container()
             .from_(image)
             # lupa, which fakeredis[lua] needs, has no Python 3.15 wheels yet: it builds from source.
-            .with_exec(["sh", "-c", "apt-get update -qq && apt-get install -qq -y --no-install-recommends build-essential"])
+            .with_exec(
+                [
+                    "sh",
+                    "-c",
+                    "apt-get update -qq && apt-get install -qq -y --no-install-recommends build-essential",
+                ]
+            )
             .with_env_variable("UV_LINK_MODE", "copy")
             .with_env_variable("UV_PYTHON_DOWNLOADS", "0")
             .with_mounted_cache("/root/.cache/uv", dag.cache_volume("uv"))
@@ -114,7 +120,9 @@ class Ci:
                     ".",
                 ]
             )
-            .with_exec(["git", "sparse-checkout", "set", "docker", "examples/full-jaffle-shop-demo"])
+            .with_exec(
+                ["git", "sparse-checkout", "set", "docker", "examples/full-jaffle-shop-demo"]
+            )
             .directory("/lightdash")
         )
 
@@ -167,7 +175,9 @@ class Ci:
             .with_user("root")
             .with_directory("/usr/app/dbt", example.directory("dbt"))
             .with_directory("/usr/app/profiles", example.directory("profiles"))
-            .with_file("/usr/bin/entrypoint.sh", self.source.file("dev/entrypoint.sh"), permissions=0o755)
+            .with_file(
+                "/usr/bin/entrypoint.sh", self.source.file("dev/entrypoint.sh"), permissions=0o755
+            )
             .with_service_binding("db", db)
             .with_service_binding("minio", minio)
         )

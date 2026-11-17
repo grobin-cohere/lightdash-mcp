@@ -10,7 +10,12 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from redis.exceptions import LockError
 
-from lightdash_mcp.auth.provider import Access, LightdashOAuthProvider, RefreshFailed, SignInRequired
+from lightdash_mcp.auth.provider import (
+    Access,
+    LightdashOAuthProvider,
+    RefreshFailed,
+    SignInRequired,
+)
 from lightdash_mcp.lightdash import LightdashClient, LightdashError
 
 RECONNECT = "Your Lightdash sign-in has ended. Reconnect this MCP server to sign in again."
@@ -18,9 +23,15 @@ UNREACHABLE = "Couldn't reach Lightdash. Try again in a moment."
 BUSY = "Another request is refreshing your Lightdash sign-in. Try again in a moment."
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
-WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
-CREATE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
-DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False)
+WRITE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+)
+CREATE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False
+)
+DESTRUCTIVE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
+)
 
 # Arguments that go into Lightdash URL paths: a `../` or `?` in one would reach another endpoint.
 UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -53,7 +64,9 @@ async def lightdash(provider: LightdashOAuthProvider) -> AsyncIterator[Lightdash
 
     # One mapping for the first token, the refresh after a 401, and the tool's own calls.
     try:
-        yield LightdashClient(provider.http, await provider.lightdash_token(token.grant_id), refresh)
+        yield LightdashClient(
+            provider.http, await provider.lightdash_token(token.grant_id), refresh
+        )
     except SignInRequired:
         raise ToolError(RECONNECT) from None
     except RefreshFailed as error:
@@ -65,7 +78,9 @@ async def lightdash(provider: LightdashOAuthProvider) -> AsyncIterator[Lightdash
             # Refused again with a freshly refreshed token: not about the sign-in, which Lightdash just renewed.
             raise ToolError(f"Lightdash refused this request (401): {error.message}") from None
         if error.status == 403:
-            raise ToolError(f"Permission denied: your Lightdash role doesn't allow this. {error.message}") from None
+            raise ToolError(
+                f"Permission denied: your Lightdash role doesn't allow this. {error.message}"
+            ) from None
         if error.status == 404:
             raise ToolError(f"Not found: {error.message}") from None
         raise ToolError(f"Lightdash error {error.status}: {error.message}") from None

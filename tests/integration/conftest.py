@@ -32,7 +32,9 @@ from lightdash_mcp.server import asgi_app
 LIGHTDASH = os.environ.get("INTEGRATION_LIGHTDASH_URL", "http://localhost:8080")
 REDIS_URL = os.environ.get("INTEGRATION_REDIS_URL", "redis://localhost:6379/15")
 REQUIRED = "INTEGRATION_LIGHTDASH_URL" in os.environ
-STARTUP_TIMEOUT = 900  # seconds: a fresh Lightdash seeds its demo data and migrates before it answers
+STARTUP_TIMEOUT = (
+    900  # seconds: a fresh Lightdash seeds its demo data and migrates before it answers
+)
 PUBLIC_PORT = 8765
 PUBLIC = f"http://localhost:{PUBLIC_PORT}"
 CLIENT_REDIRECT = "http://localhost:9999/callback"
@@ -53,7 +55,10 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while not lightdash_answers():
             if time.monotonic() > deadline:
-                pytest.exit(f"Lightdash at {LIGHTDASH} didn't start in {STARTUP_TIMEOUT} seconds", returncode=1)
+                pytest.exit(
+                    f"Lightdash at {LIGHTDASH} didn't start in {STARTUP_TIMEOUT} seconds",
+                    returncode=1,
+                )
             time.sleep(5)
         return
     if not lightdash_answers():
@@ -87,7 +92,9 @@ def settings() -> Settings:
 @pytest.fixture(scope="session")
 def server(settings: Settings):
     app = asgi_app(settings, Redis.from_url(settings.redis_url))
-    instance = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PUBLIC_PORT, log_level="warning"))
+    instance = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=PUBLIC_PORT, log_level="warning")
+    )
     thread = threading.Thread(target=instance.run, daemon=True)
     thread.start()
     for _ in range(100):
@@ -102,13 +109,19 @@ def server(settings: Settings):
 def register_client(server: str, name: str = "test client") -> dict[str, Any]:
     response = httpx.post(
         f"{server}/register",
-        json={"client_name": name, "redirect_uris": [CLIENT_REDIRECT], "token_endpoint_auth_method": "client_secret_post"},
+        json={
+            "client_name": name,
+            "redirect_uris": [CLIENT_REDIRECT],
+            "token_endpoint_auth_method": "client_secret_post",
+        },
     )
     response.raise_for_status()
     return response.json()
 
 
-def start(browser: httpx.Client, server: str, client: dict[str, Any], verifier: str) -> httpx.Response:
+def start(
+    browser: httpx.Client, server: str, client: dict[str, Any], verifier: str
+) -> httpx.Response:
     """The MCP client's /authorize, opened in the browser. Returns the consent page."""
     authorize = browser.get(
         f"{server}/authorize",
@@ -133,10 +146,17 @@ def allow(browser: httpx.Client, consent: httpx.Response) -> httpx.Response:
 
 def lightdash_sign_in(browser: httpx.Client, email: str, to_lightdash: httpx.Response) -> str:
     """Signs in to Lightdash and approves. Returns the callback URL Lightdash sends the browser to."""
-    browser.post(f"{LIGHTDASH}/api/v1/login", json={"email": email, "password": PASSWORD}).raise_for_status()
+    browser.post(
+        f"{LIGHTDASH}/api/v1/login", json={"email": email, "password": PASSWORD}
+    ).raise_for_status()
     page = browser.get(to_lightdash.headers["location"])
-    hidden = {k: html.unescape(v) for k, v in re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page.text)}
-    redirect = browser.post(f"{LIGHTDASH}/api/v1/oauth/authorize", data={**hidden, "approve": "true"})
+    hidden = {
+        k: html.unescape(v)
+        for k, v in re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page.text)
+    }
+    redirect = browser.post(
+        f"{LIGHTDASH}/api/v1/oauth/authorize", data={**hidden, "approve": "true"}
+    )
     return html.unescape(re.search(r'url=([^"]+)"', redirect.text).group(1))
 
 

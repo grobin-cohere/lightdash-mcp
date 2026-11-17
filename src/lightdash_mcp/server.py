@@ -23,7 +23,14 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lightdash_mcp.auth.audit import clip, clip_arguments, record
-from lightdash_mcp.auth.provider import FORM_LIMIT, GRANT_BUSY, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
+from lightdash_mcp.auth.provider import (
+    FORM_LIMIT,
+    GRANT_BUSY,
+    RETRY_ERROR,
+    SCOPE,
+    LightdashOAuthProvider,
+    read_body,
+)
 from lightdash_mcp.auth.store import REDIS_RETRIES, REDIS_TIMEOUT, Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
@@ -31,7 +38,10 @@ from lightdash_mcp.tools import access, code, content, data, schedulers
 SHUTDOWN_TIMEOUT = 3
 RETRY_AFTER = 5  # seconds, for a /revoke that Redis or the grant's lock kept from finishing
 UNAVAILABLE = "This server's storage didn't answer. Try again in a moment."
-NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # as the SDK's token endpoint answers
+NO_STORE = {
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+}  # as the SDK's token endpoint answers
 
 
 async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
@@ -42,7 +52,11 @@ async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> Han
     try:
         result = await call_next(ctx)
         # The result comes as the wire dict, or as a model if a handler returns one.
-        failed = bool(result.get("isError") if isinstance(result, dict) else getattr(result, "is_error", False))
+        failed = bool(
+            result.get("isError")
+            if isinstance(result, dict)
+            else getattr(result, "is_error", False)
+        )
         return result
     finally:
         token = get_access_token()
@@ -86,7 +100,9 @@ def create_server(settings: Settings, redis: Redis | None = None) -> MCPServer:
             resource_server_url=f"{settings.public_url}/mcp",
             # Tokens are only issued by this server, for this server.
             validate_token_resource=False,
-            client_registration_options=ClientRegistrationOptions(enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+            ),
             revocation_options=RevocationOptions(enabled=True),
         ),
         lifespan=lifespan,
@@ -123,7 +139,11 @@ class BasicAuthClientId:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in ("/token", "/revoke"):
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or scope["path"] not in ("/token", "/revoke")
+        ):
             return await self.app(scope, receive, send)
         headers = dict(scope["headers"])
         credentials = _basic_credentials(headers.get(b"authorization", b"").decode("latin-1"))
@@ -134,7 +154,11 @@ class BasicAuthClientId:
         if body is None:
             return await Response("Request body too large", status_code=413)(scope, receive, send)
         form = parse_qs(body.decode("utf-8", "replace"))
-        missing = {name: value for name, value in zip(("client_id", "client_secret"), credentials) if name not in form}
+        missing = {
+            name: value
+            for name, value in zip(("client_id", "client_secret"), credentials)
+            if name not in form
+        }
         if missing:
             body += (b"&" if body else b"") + urlencode(missing).encode()
             headers[b"content-length"] = str(len(body)).encode()
@@ -197,7 +221,9 @@ def _try_again(path: str, error: RedisError) -> Response:
     if not busy:
         record("storage_failed", logging.WARNING, path=path, error=type(error).__name__)
     if path == "/token":
-        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY if busy else UNAVAILABLE)
+        content = TokenErrorResponse(
+            error=RETRY_ERROR, error_description=GRANT_BUSY if busy else UNAVAILABLE
+        )
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
     # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later. RFC 7009
     # defines no body for it, and temporarily_unavailable isn't a token endpoint code.
@@ -205,7 +231,9 @@ def _try_again(path: str, error: RedisError) -> Response:
 
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
-    app = create_server(settings, redis).streamable_http_app(transport_security=transport_security(settings), host=settings.host)
+    app = create_server(settings, redis).streamable_http_app(
+        transport_security=transport_security(settings), host=settings.host
+    )
     app.add_middleware(TryAgain)
     return BasicAuthClientId(app)
 
@@ -215,7 +243,12 @@ def transport_security(settings: Settings) -> TransportSecuritySettings:
     public = urlparse(settings.public_url)
     return TransportSecuritySettings(
         allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", public.netloc],
-        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", f"{public.scheme}://{public.netloc}"],
+        allowed_origins=[
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            f"{public.scheme}://{public.netloc}",
+        ],
     )
 
 
@@ -226,7 +259,9 @@ def main() -> None:
     # Ctrl+C is a normal stop: no traceback. MCP clients keep a stream open, so a stop waits for them
     # at most SHUTDOWN_TIMEOUT seconds instead of until they disconnect.
     try:
-        uvicorn.run(app, host=settings.host, port=settings.port, timeout_graceful_shutdown=SHUTDOWN_TIMEOUT)
+        uvicorn.run(
+            app, host=settings.host, port=settings.port, timeout_graceful_shutdown=SHUTDOWN_TIMEOUT
+        )
     except KeyboardInterrupt:
         pass
 

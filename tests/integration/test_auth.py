@@ -2,19 +2,36 @@
 
 import httpx
 
-from .conftest import ADMIN, VIEWER, allow, authorize, exchange, lightdash_sign_in, register_client, sign_in, start
+from .conftest import (
+    ADMIN,
+    VIEWER,
+    allow,
+    authorize,
+    exchange,
+    lightdash_sign_in,
+    register_client,
+    sign_in,
+    start,
+)
 
 
 def mcp_status(server: str, access_token: str) -> int:
     """Status of an MCP initialize request with this token: 401 when the token is not accepted."""
     response = httpx.post(
         f"{server}/mcp",
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json, text/event-stream"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json, text/event-stream",
+        },
         json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}},
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"},
+            },
         },
     )
     return response.status_code
@@ -57,7 +74,10 @@ def test_consent_requires_the_cookie(server):
         assert "test client" in page.text
         transaction = authorize.headers["location"].split("transaction=")[1]
     # A cross-site form post carries no cookie.
-    forged = httpx.post(f"{server}/oauth/consent", data={"transaction": transaction, "csrf": "guess", "action": "allow"})
+    forged = httpx.post(
+        f"{server}/oauth/consent",
+        data={"transaction": transaction, "csrf": "guess", "action": "allow"},
+    )
     assert forged.status_code == 400
 
 
@@ -123,7 +143,11 @@ async def test_a_reused_refresh_token_ends_the_sign_in(server, tool):
 
 
 async def test_sign_ins_stay_separate(server, tool):
-    admin_a, admin_b, viewer = sign_in(server, ADMIN), sign_in(server, ADMIN), sign_in(server, VIEWER)
+    admin_a, admin_b, viewer = (
+        sign_in(server, ADMIN),
+        sign_in(server, ADMIN),
+        sign_in(server, VIEWER),
+    )
     assert not (await tool(admin_a, "list_roles")).is_error
     assert (await tool(viewer, "list_roles")).is_error
 

@@ -30,22 +30,36 @@ UNCOMPARED = {"version", "updatedAt", "downloadedAt", "contentType"}
 def _require(item: dict[str, Any], keys: tuple[str, ...], kind: str) -> None:
     missing = [key for key in keys if item.get(key) in (None, "")]
     if missing:
-        raise ToolError(f"The {kind} needs {', '.join(missing)}. Read one with get_{kind}_code to see the format.")
+        raise ToolError(
+            f"The {kind} needs {', '.join(missing)}. Read one with get_{kind}_code to see the format."
+        )
     if not conforms(Slug, item["slug"]):
-        raise ToolError(f"Invalid slug {item['slug']!r}: use lowercase letters, digits and hyphens, such as my-team-ci-health.")
+        raise ToolError(
+            f"Invalid slug {item['slug']!r}: use lowercase letters, digits and hyphens, such as my-team-ci-health."
+        )
 
 
-async def _read(ld: LightdashClient, project_uuid: str, kind: Kind, slugs: list[str]) -> dict[str, Any]:
+async def _read(
+    ld: LightdashClient, project_uuid: str, kind: Kind, slugs: list[str]
+) -> dict[str, Any]:
     return await ld.get(f"/api/v1/projects/{project_uuid}/code/{kind}", ids=slugs)
 
 
-async def _existing(ld: LightdashClient, project_uuid: str, kind: Kind, slug: str) -> dict[str, Any] | None:
+async def _existing(
+    ld: LightdashClient, project_uuid: str, kind: Kind, slug: str
+) -> dict[str, Any] | None:
     found = (await _read(ld, project_uuid, kind, [slug]))[kind]
     return found[0] if found else None
 
 
-def keep_existing(kind: Kind, item: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
-    kept = {key: existing[key] for key in KEPT[kind] if key in existing and key not in item} if existing else {}
+def keep_existing(
+    kind: Kind, item: dict[str, Any], existing: dict[str, Any] | None
+) -> dict[str, Any]:
+    kept = (
+        {key: existing[key] for key in KEPT[kind] if key in existing and key not in item}
+        if existing
+        else {}
+    )
     return kept | item
 
 
@@ -53,7 +67,11 @@ def _field_ids(value: Any) -> set[str]:
     """Every field a filter group refers to, nested and/or groups included."""
     if isinstance(value, dict):
         target = value.get("target")
-        own = {target["fieldId"]} if isinstance(target, dict) and isinstance(target.get("fieldId"), str) else set()
+        own = (
+            {target["fieldId"]}
+            if isinstance(target, dict) and isinstance(target.get("fieldId"), str)
+            else set()
+        )
         return own.union(*(_field_ids(v) for v in value.values()))
     if isinstance(value, list):
         return set().union(*(_field_ids(v) for v in value))
@@ -63,7 +81,8 @@ def _field_ids(value: Any) -> set[str]:
 def _entries(query: dict[str, Any], key: str, *fields: str) -> list[dict[str, Any]]:
     entries = query.get(key) or []
     if not isinstance(entries, list) or not all(
-        isinstance(entry, dict) and all(isinstance(entry.get(field), str) for field in fields) for entry in entries
+        isinstance(entry, dict) and all(isinstance(entry.get(field), str) for field in fields)
+        for entry in entries
     ):
         raise ToolError(f"Each of metricQuery.{key} needs {' and '.join(fields)}.")
     return entries
@@ -86,10 +105,15 @@ async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, A
         raise ToolError(f"Invalid explore {explore!r}.")
     found = await load_explore(ld, project_uuid, explore)
     # Hidden fields are only left out of the sidebar: a chart can use them.
-    known = {*explore_fields(found, "dimensions", include_hidden=True), *explore_fields(found, "metrics", include_hidden=True)}
+    known = {
+        *explore_fields(found, "dimensions", include_hidden=True),
+        *explore_fields(found, "metrics", include_hidden=True),
+    }
     known |= {calc["name"] for calc in _entries(query, "tableCalculations", "name")}
     known |= {dim["id"] for dim in _entries(query, "customDimensions", "id")}
-    known |= {f"{m['table']}_{m['name']}" for m in _entries(query, "additionalMetrics", "table", "name")}
+    known |= {
+        f"{m['table']}_{m['name']}" for m in _entries(query, "additionalMetrics", "table", "name")
+    }
     used = {*_field_list(query, "dimensions"), *_field_list(query, "metrics")}
     used |= {sort["fieldId"] for sort in _entries(query, "sorts", "fieldId")}
     used |= _field_ids(query.get("filters") or {})
@@ -98,19 +122,27 @@ async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, A
         raise ToolError(f"Unknown fields in {explore}: {', '.join(unknown)}. See get_explore.")
 
 
-async def check_dashboard(ld: LightdashClient, project_uuid: str, dashboard: dict[str, Any]) -> list[str]:
+async def check_dashboard(
+    ld: LightdashClient, project_uuid: str, dashboard: dict[str, Any]
+) -> list[str]:
     """Fail when a tile is malformed. Return the chart slugs its tiles show that don't exist yet: Lightdash would
     save those tiles empty, so saving fails until they exist, but a dry run only reports them."""
     tiles = dashboard["tiles"]
     if not isinstance(tiles, list):
         raise ToolError("tiles must be a list.")
     for n, tile in enumerate(tiles):
-        missing = [key for key in ("type", "x", "y", "w", "h", "properties") if not isinstance(tile, dict) or key not in tile]
+        missing = [
+            key
+            for key in ("type", "x", "y", "w", "h", "properties")
+            if not isinstance(tile, dict) or key not in tile
+        ]
         if missing:
             raise ToolError(f"Tile {n} needs {', '.join(missing)}.")
         if not isinstance(tile["properties"], dict):
             raise ToolError(f"Tile {n} properties must be an object.")
-        if tile["type"] == "saved_chart" and not isinstance(tile["properties"].get("chartSlug"), str):
+        if tile["type"] == "saved_chart" and not isinstance(
+            tile["properties"].get("chartSlug"), str
+        ):
             raise ToolError(f"Tile {n} is a saved_chart tile without properties.chartSlug.")
     slugs = sorted({t["properties"]["chartSlug"] for t in tiles if t["type"] == "saved_chart"})
     if not slugs:
@@ -128,25 +160,39 @@ def _counts(dashboard: dict[str, Any]) -> dict[str, int]:
     return {
         "tiles": len(dashboard.get("tiles") or []),
         "tabs": len(dashboard.get("tabs") or []),
-        "filters": sum(len(filters.get(key) or []) for key in ("dimensions", "metrics", "tableCalculations")),
+        "filters": sum(
+            len(filters.get(key) or []) for key in ("dimensions", "metrics", "tableCalculations")
+        ),
     }
 
 
 async def preview(
-    ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], existing: dict[str, Any] | None
+    ld: LightdashClient,
+    project_uuid: str,
+    kind: Kind,
+    item: dict[str, Any],
+    existing: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    summary: dict[str, Any] = {"slug": item["slug"], "name": item["name"], "space": item["spaceSlug"]}
+    summary: dict[str, Any] = {
+        "slug": item["slug"],
+        "name": item["name"],
+        "space": item["spaceSlug"],
+    }
     if existing:
         summary["replaces"] = {
             "name": existing.get("name"),
             "space": existing.get("spaceSlug"),
             "updatedAt": existing.get("updatedAt"),
         }
-        summary["changes"] = sorted(key for key in item if key not in UNCOMPARED and item[key] != existing.get(key))
+        summary["changes"] = sorted(
+            key for key in item if key not in UNCOMPARED and item[key] != existing.get(key)
+        )
         if kind == "dashboards":
             summary |= {"before": _counts(existing), "after": _counts(item)}
     if not await _space_exists(ld, project_uuid, item["spaceSlug"]):
-        summary["newSpace"] = "Lightdash creates this space, visible only to you and admins until you share it."
+        summary["newSpace"] = (
+            "Lightdash creates this space, visible only to you and admins until you share it."
+        )
     singular = kind[:-1]
     return {
         "wouldUpdate" if existing else "wouldCreate": summary,
@@ -154,11 +200,15 @@ async def preview(
     }
 
 
-async def save(ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], lightdash_url: str) -> dict[str, Any]:
+async def save(
+    ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], lightdash_url: str
+) -> dict[str, Any]:
     # Without force, Lightdash skips a chart update whose name, description and slug are unchanged and whose
     # updatedAt isn't newer (PromoteService.isChartUpdated). Dashboards always update and ignore it.
     body = item | {"skipSpaceCreate": False, "publicSpaceCreate": False, "force": True}
-    results = await ld.request("POST", f"/api/v1/projects/{project_uuid}/code/{kind}/{item['slug']}", json=body)
+    results = await ld.request(
+        "POST", f"/api/v1/projects/{project_uuid}/code/{kind}/{item['slug']}", json=body
+    )
     saved = results[kind][0]
     uuid = saved["data"]["uuid"]
     singular = kind[:-1]
@@ -171,15 +221,23 @@ async def save(ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[st
     }
     # The content is saved by now: a validation failure is reported, not raised.
     try:
-        validation = await ld.request("POST", f"/api/v1/projects/{project_uuid}/validate/{singular}/{uuid}", json={})
+        validation = await ld.request(
+            "POST", f"/api/v1/projects/{project_uuid}/validate/{singular}/{uuid}", json={}
+        )
     except LightdashError as error:
         if error.status == 401:
             raise
-        result["validationFailed"] = f"The {singular} is saved, but Lightdash couldn't validate it: {error.message}"
+        result["validationFailed"] = (
+            f"The {singular} is saved, but Lightdash couldn't validate it: {error.message}"
+        )
     except httpx.HTTPError:
-        result["validationFailed"] = f"The {singular} is saved, but Lightdash didn't answer its validation."
+        result["validationFailed"] = (
+            f"The {singular} is saved, but Lightdash didn't answer its validation."
+        )
     else:
-        result["validationErrors"] = [{"field": e.get("fieldName"), "error": e.get("error")} for e in validation["errors"]]
+        result["validationErrors"] = [
+            {"field": e.get("fieldName"), "error": e.get("error")} for e in validation["errors"]
+        ]
     return result
 
 
@@ -206,7 +264,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         return dashboard
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def save_chart(project_uuid: Uuid, chart: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
+    async def save_chart(
+        project_uuid: Uuid, chart: dict[str, Any], dry_run: bool = True
+    ) -> dict[str, Any]:
         """Create a chart, or replace the chart with the same slug, from chart code: name, slug, spaceSlug,
         tableName (the explore), metricQuery (exploreName, dimensions, metrics, filters, sorts, limit,
         tableCalculations) and chartConfig, as get_chart_code returns them. Fields must exist in the explore:
@@ -225,7 +285,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             return await save(ld, project_uuid, "charts", item, provider.settings.lightdash_url)
 
     @server.tool(annotations=DESTRUCTIVE)
-    async def save_dashboard(project_uuid: Uuid, dashboard: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
+    async def save_dashboard(
+        project_uuid: Uuid, dashboard: dict[str, Any], dry_run: bool = True
+    ) -> dict[str, Any]:
         """Create a dashboard, or replace the dashboard with the same slug, from dashboard code: name, slug,
         spaceSlug and tiles, as get_dashboard_code returns them. A tile has type (saved_chart, markdown),
         x, y, w and h on a 36-column grid, and properties: chartSlug for a saved chart, title and content for
@@ -239,7 +301,10 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         async with lightdash(provider) as ld:
             missing = await check_dashboard(ld, project_uuid, dashboard)
             existing = await _existing(ld, project_uuid, "dashboards", dashboard["slug"])
-            item = {"tabs": [], **keep_existing("dashboards", {"version": 1, **dashboard}, existing)}
+            item = {
+                "tabs": [],
+                **keep_existing("dashboards", {"version": 1, **dashboard}, existing),
+            }
             if dry_run:
                 result = await preview(ld, project_uuid, "dashboards", item, existing)
                 if missing:

@@ -34,19 +34,26 @@ async def test_tool_arguments_cannot_reach_other_endpoints(settings):
 
 
 def test_missing_settings_stop_the_server():
-    with pytest.raises(SystemExit, match="LIGHTDASH_CLIENT_ID, LIGHTDASH_CLIENT_SECRET, FERNET_KEY"):
+    with pytest.raises(
+        SystemExit, match="LIGHTDASH_CLIENT_ID, LIGHTDASH_CLIENT_SECRET, FERNET_KEY"
+    ):
         Settings(_env_file=None).check()
 
 
 def test_public_url_follows_the_port_unless_set():
     assert Settings(_env_file=None, port=9000).public_url == "http://localhost:9000"
-    assert Settings(_env_file=None, port=9000, public_url="https://mcp.example.com/").public_url == "https://mcp.example.com"
+    assert (
+        Settings(_env_file=None, port=9000, public_url="https://mcp.example.com/").public_url
+        == "https://mcp.example.com"
+    )
 
 
 @respx.mock
 async def test_client_sends_bearer_and_unwraps_results(client):
     route = respx.get(f"{LIGHTDASH}/api/v1/user").mock(
-        return_value=httpx.Response(200, json={"status": "ok", "results": {"email": "demo@lightdash.com"}})
+        return_value=httpx.Response(
+            200, json={"status": "ok", "results": {"email": "demo@lightdash.com"}}
+        )
     )
 
     assert await client.request("GET", "/api/v1/user") == {"email": "demo@lightdash.com"}
@@ -58,7 +65,11 @@ async def test_client_handles_empty_bodies_and_errors(client):
     respx.put(f"{LIGHTDASH}/api/v1/groups/g/members/u").mock(return_value=httpx.Response(204))
     respx.get(f"{LIGHTDASH}/api/v2/orgs/o/roles").mock(
         return_value=httpx.Response(
-            403, json={"status": "error", "error": {"statusCode": 403, "name": "ForbiddenError", "message": "Not allowed"}}
+            403,
+            json={
+                "status": "error",
+                "error": {"statusCode": 403, "name": "ForbiddenError", "message": "Not allowed"},
+            },
         )
     )
 
@@ -82,7 +93,12 @@ async def test_client_treats_redirects_as_errors(client):
 async def test_content_reads_every_page(client):
     def page(request):
         number = int(request.url.params["page"])
-        return httpx.Response(200, json={"results": {"data": [{"uuid": str(number)}], "pagination": {"totalPageCount": 60}}})
+        return httpx.Response(
+            200,
+            json={
+                "results": {"data": [{"uuid": str(number)}], "pagination": {"totalPageCount": 60}}
+            },
+        )
 
     respx.get(f"{LIGHTDASH}/api/v2/content").mock(side_effect=page)
 
@@ -96,7 +112,12 @@ async def test_explores_follow_the_tables_configuration(client):
     def explores(request):
         # Lightdash leaves out the explores that the tables configuration hides only with filtered=true.
         hidden = [] if request.url.params.get("filtered") == "true" else [{"name": "stg_orders"}]
-        return httpx.Response(200, json={"results": [{"name": "orders", "label": "Orders", "groupLabel": "Sales"}, *hidden]})
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"name": "orders", "label": "Orders", "groupLabel": "Sales"}, *hidden]
+            },
+        )
 
     respx.get(f"{LIGHTDASH}/api/v1/projects/project/explores").mock(side_effect=explores)
 
@@ -108,7 +129,9 @@ async def test_explores_follow_the_tables_configuration(client):
 async def test_health_follows_redis(settings):
     for redis, status in [(FakeAsyncRedis(), 200), (Redis.from_url("redis://localhost:1"), 503)]:
         app = create_server(settings, redis).streamable_http_app()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://localhost") as client:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://localhost"
+        ) as client:
             assert (await client.get("/health")).status_code == status
 
 
