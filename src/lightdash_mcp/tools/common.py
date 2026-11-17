@@ -26,9 +26,6 @@ READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
 )
-CREATE = ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False
-)
 DESTRUCTIVE = ToolAnnotations(
     read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
 )
@@ -42,11 +39,11 @@ Slug = Annotated[str, Field(pattern=f"^{SLUG}$")]
 ChartRef = Annotated[str, Field(pattern=f"^{SLUG}$|^{UUID}$")]
 
 
-async def resolve_chart(ld: LightdashClient, project_uuid: str, chart: str) -> str:
+async def resolve_chart(client: LightdashClient, project_uuid: str, chart: str) -> str:
     """The UUID of a chart of the project, given by UUID or by slug."""
     if re.fullmatch(UUID, chart):
         return chart
-    found = await ld.get(f"/api/v1/saved/{chart}")
+    found = await client.get(f"/api/v1/saved/{chart}")
     if found.get("projectUuid") != project_uuid:
         raise ToolError(f"No chart with slug {chart} in this project.")
     return found["uuid"]
@@ -90,11 +87,6 @@ async def lightdash(provider: LightdashOAuthProvider) -> AsyncIterator[Lightdash
 
 def pick(item: dict[str, Any], *keys: str) -> dict[str, Any]:
     return {key: item.get(key) for key in keys}
-
-
-def data(results: Any) -> list[dict[str, Any]]:
-    """Lightdash list results, paginated (`{"data": [...]}`) or not."""
-    return results["data"] if isinstance(results, dict) and "data" in results else results
 
 
 def full_name(item: dict[str, Any]) -> str:

@@ -40,15 +40,15 @@ def _require(item: dict[str, Any], keys: tuple[str, ...], kind: str) -> None:
 
 
 async def _read(
-    ld: LightdashClient, project_uuid: str, kind: Kind, slugs: list[str]
+    client: LightdashClient, project_uuid: str, kind: Kind, slugs: list[str]
 ) -> dict[str, Any]:
-    return await ld.get(f"/api/v1/projects/{project_uuid}/code/{kind}", ids=slugs)
+    return await client.get(f"/api/v1/projects/{project_uuid}/code/{kind}", ids=slugs)
 
 
 async def _existing(
-    ld: LightdashClient, project_uuid: str, kind: Kind, slug: str
+    client: LightdashClient, project_uuid: str, kind: Kind, slug: str
 ) -> dict[str, Any] | None:
-    found = (await _read(ld, project_uuid, kind, [slug]))[kind]
+    found = (await _read(client, project_uuid, kind, [slug]))[kind]
     return found[0] if found else None
 
 
@@ -95,7 +95,7 @@ def _field_list(query: dict[str, Any], key: str) -> list[str]:
     return values
 
 
-async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, Any]) -> None:
+async def check_chart(client: LightdashClient, project_uuid: str, chart: dict[str, Any]) -> None:
     """Fail before saving when the chart is malformed or refers to fields its explore doesn't have."""
     query = chart["metricQuery"]
     if not isinstance(query, dict):
@@ -103,7 +103,7 @@ async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, A
     explore = query.get("exploreName") or chart["tableName"]
     if not conforms(Name, explore):
         raise ToolError(f"Invalid explore {explore!r}.")
-    found = await load_explore(ld, project_uuid, explore)
+    found = await load_explore(client, project_uuid, explore)
     # Hidden fields are only left out of the sidebar: a chart can use them.
     known = {
         *explore_fields(found, "dimensions", include_hidden=True),
@@ -123,7 +123,7 @@ async def check_chart(ld: LightdashClient, project_uuid: str, chart: dict[str, A
 
 
 async def check_dashboard(
-    ld: LightdashClient, project_uuid: str, dashboard: dict[str, Any]
+    client: LightdashClient, project_uuid: str, dashboard: dict[str, Any]
 ) -> list[str]:
     """Fail when a tile is malformed. Return the chart slugs its tiles show that don't exist yet: Lightdash would
     save those tiles empty, so saving fails until they exist, but a dry run only reports them."""
@@ -147,11 +147,11 @@ async def check_dashboard(
     slugs = sorted({t["properties"]["chartSlug"] for t in tiles if t["type"] == "saved_chart"})
     if not slugs:
         return []
-    return sorted((await _read(ld, project_uuid, "charts", slugs)).get("missingIds") or [])
+    return sorted((await _read(client, project_uuid, "charts", slugs)).get("missingIds") or [])
 
 
-async def _space_exists(ld: LightdashClient, project_uuid: str, slug: str) -> bool:
-    spaces = await ld.get(f"/api/v1/projects/{project_uuid}/spaces")
+async def _space_exists(client: LightdashClient, project_uuid: str, slug: str) -> bool:
+    spaces = await client.get(f"/api/v1/projects/{project_uuid}/spaces")
     return any(space_slug(space) == slug for space in spaces)
 
 
@@ -167,7 +167,7 @@ def _counts(dashboard: dict[str, Any]) -> dict[str, int]:
 
 
 async def preview(
-    ld: LightdashClient,
+    client: LightdashClient,
     project_uuid: str,
     kind: Kind,
     item: dict[str, Any],
@@ -189,7 +189,7 @@ async def preview(
         )
         if kind == "dashboards":
             summary |= {"before": _counts(existing), "after": _counts(item)}
-    if not await _space_exists(ld, project_uuid, item["spaceSlug"]):
+    if not await _space_exists(client, project_uuid, item["spaceSlug"]):
         summary["newSpace"] = (
             "Lightdash creates this space, visible only to you and admins until you share it."
         )
@@ -201,12 +201,12 @@ async def preview(
 
 
 async def save(
-    ld: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], lightdash_url: str
+    client: LightdashClient, project_uuid: str, kind: Kind, item: dict[str, Any], lightdash_url: str
 ) -> dict[str, Any]:
     # Without force, Lightdash skips a chart update whose name, description and slug are unchanged and whose
     # updatedAt isn't newer (PromoteService.isChartUpdated). Dashboards always update and ignore it.
     body = item | {"skipSpaceCreate": False, "publicSpaceCreate": False, "force": True}
-    results = await ld.request(
+    results = await client.request(
         "POST", f"/api/v1/projects/{project_uuid}/code/{kind}/{item['slug']}", json=body
     )
     saved = results[kind][0]
@@ -221,7 +221,7 @@ async def save(
     }
     # The content is saved by now: a validation failure is reported, not raised.
     try:
-        validation = await ld.request(
+        validation = await client.request(
             "POST", f"/api/v1/projects/{project_uuid}/validate/{singular}/{uuid}", json={}
         )
     except LightdashError as error:
@@ -247,8 +247,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """Read a saved chart as code, in the format save_chart takes: its explore, fields, filters, sorts and
         chart configuration. Use it to change a chart, or as an example before writing a new one.
         Find slugs with search_content."""
-        async with lightdash(provider) as ld:
-            chart = await _existing(ld, project_uuid, "charts", slug)
+        async with lightdash(provider) as client:
+            chart = await _existing(client, project_uuid, "charts", slug)
         if chart is None:
             raise ToolError(f"No chart with slug {slug} in this project.")
         return chart
@@ -257,8 +257,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def get_dashboard_code(project_uuid: Uuid, slug: Slug) -> dict[str, Any]:
         """Read a dashboard as code, in the format save_dashboard takes: its tiles with their position and the
         slug of each chart, its tabs and its filters. Find slugs with search_content."""
-        async with lightdash(provider) as ld:
-            dashboard = await _existing(ld, project_uuid, "dashboards", slug)
+        async with lightdash(provider) as client:
+            dashboard = await _existing(client, project_uuid, "dashboards", slug)
         if dashboard is None:
             raise ToolError(f"No dashboard with slug {slug} in this project.")
         return dashboard
@@ -276,13 +276,13 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         dry_run, on by default, checks the chart and says whether it would create or replace one, and what changes.
         Pass dry_run=false to save; the result has the chart's URL and Lightdash's validation errors."""
         _require(chart, CHART_KEYS, "chart")
-        async with lightdash(provider) as ld:
-            await check_chart(ld, project_uuid, chart)
-            existing = await _existing(ld, project_uuid, "charts", chart["slug"])
+        async with lightdash(provider) as client:
+            await check_chart(client, project_uuid, chart)
+            existing = await _existing(client, project_uuid, "charts", chart["slug"])
             item = keep_existing("charts", {"version": 1, **chart}, existing)
             if dry_run:
-                return await preview(ld, project_uuid, "charts", item, existing)
-            return await save(ld, project_uuid, "charts", item, provider.settings.lightdash_url)
+                return await preview(client, project_uuid, "charts", item, existing)
+            return await save(client, project_uuid, "charts", item, provider.settings.lightdash_url)
 
     @server.tool(annotations=DESTRUCTIVE)
     async def save_dashboard(
@@ -298,15 +298,15 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         changes, with the tile, tab and filter counts before and after. Pass dry_run=false to save; the result has
         the dashboard's URL."""
         _require(dashboard, DASHBOARD_KEYS, "dashboard")
-        async with lightdash(provider) as ld:
-            missing = await check_dashboard(ld, project_uuid, dashboard)
-            existing = await _existing(ld, project_uuid, "dashboards", dashboard["slug"])
+        async with lightdash(provider) as client:
+            missing = await check_dashboard(client, project_uuid, dashboard)
+            existing = await _existing(client, project_uuid, "dashboards", dashboard["slug"])
             item = {
                 "tabs": [],
                 **keep_existing("dashboards", {"version": 1, **dashboard}, existing),
             }
             if dry_run:
-                result = await preview(ld, project_uuid, "dashboards", item, existing)
+                result = await preview(client, project_uuid, "dashboards", item, existing)
                 if missing:
                     result["chartsNotSavedYet"] = missing
                     result["next"] = (
@@ -318,4 +318,6 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 raise ToolError(
                     f"No chart with slug {', '.join(missing)} in this project yet. Save it with save_chart and dry_run=false first."
                 )
-            return await save(ld, project_uuid, "dashboards", item, provider.settings.lightdash_url)
+            return await save(
+                client, project_uuid, "dashboards", item, provider.settings.lightdash_url
+            )

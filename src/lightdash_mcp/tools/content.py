@@ -17,15 +17,17 @@ ContentType = Literal["chart", "dashboard", "space"]
 VALIDATION_TIMEOUT = 120
 
 
-async def _content(ld: LightdashClient, project_uuid: str, **params: Any) -> list[dict[str, Any]]:
-    return await every_page(ld, "/api/v2/content", projectUuids=project_uuid, **params)
+async def _content(
+    client: LightdashClient, project_uuid: str, **params: Any
+) -> list[dict[str, Any]]:
+    return await every_page(client, "/api/v2/content", projectUuids=project_uuid, **params)
 
 
 async def _item(
-    ld: LightdashClient, project_uuid: str, content_type: ContentType, uuid: str
+    client: LightdashClient, project_uuid: str, content_type: ContentType, uuid: str
 ) -> dict[str, Any]:
     # Check the UUID rather than trust the filter: deleting the wrong space deletes everything in it.
-    items = await _content(ld, project_uuid, uuids=uuid, contentTypes=content_type)
+    items = await _content(client, project_uuid, uuids=uuid, contentTypes=content_type)
     item = next(
         (i for i in items if i["uuid"] == uuid.lower() and i["contentType"] == content_type), None
     )
@@ -109,9 +111,12 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     ) -> list[dict[str, Any]]:
         """Find charts and dashboards by name, or list them all without search.
         Run a chart with run_chart, and open a dashboard with get_dashboard."""
-        async with lightdash(provider) as ld:
+        async with lightdash(provider) as client:
             items = await _content(
-                ld, project_uuid, search=search, contentTypes=content_type or ["chart", "dashboard"]
+                client,
+                project_uuid,
+                search=search,
+                contentTypes=content_type or ["chart", "dashboard"],
             )
         return [
             {
@@ -127,8 +132,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def get_dashboard(dashboard_uuid: Uuid) -> dict[str, Any]:
         """Show a dashboard's filters and tiles in layout order: its charts, to run with run_chart and the
         dashboard's UUID, and its text."""
-        async with lightdash(provider) as ld:
-            dashboard = await ld.get(f"/api/v1/dashboards/{dashboard_uuid}")
+        async with lightdash(provider) as client:
+            dashboard = await client.get(f"/api/v1/dashboards/{dashboard_uuid}")
         tabs = sorted(dashboard.get("tabs") or [], key=lambda t: t["order"])
         names, order = (
             {t["uuid"]: t["name"] for t in tabs},
@@ -165,9 +170,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """Find charts and dashboards nobody has viewed in `unused_days` days, never-viewed first.
         Content created within that window is left out, and so is viewed content whose last view date
         Lightdash doesn't record."""
-        async with lightdash(provider) as ld:
+        async with lightdash(provider) as client:
             items = await _content(
-                ld, project_uuid, contentTypes=content_type or ["chart", "dashboard"]
+                client, project_uuid, contentTypes=content_type or ["chart", "dashboard"]
             )
         return unused_content(items, unused_days)
 
@@ -177,11 +182,11 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     ) -> list[dict[str, Any]]:
         """List broken charts and dashboards: fields that no longer exist, bad configurations.
         Results come from the last validation run; set revalidate to run a fresh one first."""
-        async with lightdash(provider) as ld:
+        async with lightdash(provider) as client:
             if revalidate:
-                job = await ld.request("POST", f"/api/v1/projects/{project_uuid}/validate")
+                job = await client.request("POST", f"/api/v1/projects/{project_uuid}/validate")
                 for _ in range(VALIDATION_TIMEOUT):
-                    status = (await ld.get(f"/api/v1/schedulers/job/{job['jobId']}/status"))[
+                    status = (await client.get(f"/api/v1/schedulers/job/{job['jobId']}/status"))[
                         "status"
                     ]
                     if status in ("completed", "error"):
@@ -189,7 +194,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                     await asyncio.sleep(1)
                 if status != "completed":
                     raise ToolError(f"Validation did not complete (status: {status}).")
-            errors = await ld.get(f"/api/v1/projects/{project_uuid}/validate")
+            errors = await client.get(f"/api/v1/projects/{project_uuid}/validate")
         return [
             {
                 "source": e.get("source"),
@@ -209,9 +214,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         project_uuid: Uuid, content_type: ContentType, uuid: Uuid, target_space_uuid: Uuid
     ) -> str:
         """Move a chart, dashboard or space into another space."""
-        async with lightdash(provider) as ld:
-            item = await _item(ld, project_uuid, content_type, uuid)
-            await ld.request(
+        async with lightdash(provider) as client:
+            item = await _item(client, project_uuid, content_type, uuid)
+            await client.request(
                 "POST",
                 f"/api/v2/content/{project_uuid}/move",
                 json={
@@ -227,11 +232,13 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     ) -> dict[str, Any]:
         """Delete a chart, dashboard or space. A space is deleted with everything in it.
         dry_run, on by default, shows what would be deleted. Pass dry_run=false to delete."""
-        async with lightdash(provider) as ld:
-            item = await _item(ld, project_uuid, content_type, uuid)
+        async with lightdash(provider) as client:
+            item = await _item(client, project_uuid, content_type, uuid)
             impact: dict[str, Any] = {"item": _summary(item)}
             if content_type == "space":
-                found = await ld.get(f"/api/v1/projects/{project_uuid}/spaces/{uuid}/delete-impact")
+                found = await client.get(
+                    f"/api/v1/projects/{project_uuid}/spaces/{uuid}/delete-impact"
+                )
                 impact["includes"] = {
                     k: [c.get("name") for c in v]
                     for k, v in found.items()
@@ -239,7 +246,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 }
             if dry_run:
                 return {"wouldDelete": impact}
-            await ld.request(
+            await client.request(
                 "POST",
                 f"/api/v2/content/{project_uuid}/delete",
                 json={"item": _payload(item), "action": {"type": "delete"}},

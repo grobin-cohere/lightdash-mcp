@@ -11,12 +11,14 @@ from lightdash_mcp.tools.shared import every_page
 
 
 async def update(
-    ld: LightdashClient, scheduler_uuid: str, changes: dict[str, Any]
+    client: LightdashClient, scheduler_uuid: str, changes: dict[str, Any]
 ) -> dict[str, Any]:
     # PATCH writes every column, so a field left out becomes null (SchedulerModel.updateScheduler):
     # send the whole scheduler back with the changes. Lightdash ignores the read-only fields.
-    current = await ld.get(f"/api/v1/schedulers/{scheduler_uuid}")
-    return await ld.request("PATCH", f"/api/v1/schedulers/{scheduler_uuid}", json=current | changes)
+    current = await client.get(f"/api/v1/schedulers/{scheduler_uuid}")
+    return await client.request(
+        "PATCH", f"/api/v1/schedulers/{scheduler_uuid}", json=current | changes
+    )
 
 
 def _summary(s: dict[str, Any]) -> dict[str, Any]:
@@ -45,9 +47,9 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         project_uuid: Uuid, search: str | None = None
     ) -> list[dict[str, Any]]:
         """List a project's scheduled deliveries with their schedule, owner, recipients and latest run."""
-        async with lightdash(provider) as ld:
+        async with lightdash(provider) as client:
             schedulers = await every_page(
-                ld,
+                client,
                 f"/api/v1/schedulers/{project_uuid}/list",
                 searchQuery=search,
                 includeLatestRun="true",
@@ -57,8 +59,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     @server.tool(annotations=WRITE)
     async def set_scheduler_enabled(scheduler_uuid: Uuid, enabled: bool) -> str:
         """Pause (enabled=false) or resume (enabled=true) a scheduled delivery."""
-        async with lightdash(provider) as ld:
-            await ld.request(
+        async with lightdash(provider) as client:
+            await client.request(
                 "PATCH", f"/api/v1/schedulers/{scheduler_uuid}/enabled", json={"enabled": enabled}
             )
         return "Resumed the delivery." if enabled else "Paused the delivery."
@@ -83,15 +85,15 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
             }.items()
             if v is not None
         }
-        async with lightdash(provider) as ld:
-            return _summary(await update(ld, scheduler_uuid, changes))
+        async with lightdash(provider) as client:
+            return _summary(await update(client, scheduler_uuid, changes))
 
     @server.tool(annotations=DESTRUCTIVE)
     async def delete_scheduler(scheduler_uuid: Uuid, dry_run: bool = True) -> dict[str, Any]:
         """Delete a scheduled delivery. dry_run, on by default, shows it. Pass dry_run=false to delete it."""
-        async with lightdash(provider) as ld:
-            scheduler = _summary(await ld.get(f"/api/v1/schedulers/{scheduler_uuid}"))
+        async with lightdash(provider) as client:
+            scheduler = _summary(await client.get(f"/api/v1/schedulers/{scheduler_uuid}"))
             if dry_run:
                 return {"wouldDelete": scheduler}
-            await ld.request("DELETE", f"/api/v1/schedulers/{scheduler_uuid}")
+            await client.request("DELETE", f"/api/v1/schedulers/{scheduler_uuid}")
         return {"deleted": scheduler}

@@ -78,8 +78,8 @@ def _summary(field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def load_explore(ld: LightdashClient, project_uuid: str, explore: str) -> dict[str, Any]:
-    found = await ld.get(f"/api/v1/projects/{project_uuid}/explores/{explore}")
+async def load_explore(client: LightdashClient, project_uuid: str, explore: str) -> dict[str, Any]:
+    found = await client.get(f"/api/v1/projects/{project_uuid}/explores/{explore}")
     if "tables" not in found:
         raise ToolError(f"Explore {explore} has errors: {found.get('errors')}")
     return found
@@ -102,22 +102,22 @@ def _filter_group(filters: list[Filter]) -> dict[str, Any] | None:
 
 
 async def _run(
-    ld: LightdashClient, project_uuid: str, endpoint: str, body: dict[str, Any], page_size: int
+    client: LightdashClient, project_uuid: str, endpoint: str, body: dict[str, Any], page_size: int
 ) -> dict[str, Any]:
     """Start a Lightdash query, wait for it, and return its first page of results."""
-    started = await ld.request(
+    started = await client.request(
         "POST", f"/api/v2/projects/{project_uuid}/query/{endpoint}", json=body | {"context": "api"}
     )
     path = f"/api/v2/projects/{project_uuid}/query/{started['queryUuid']}"
     try:
         async with asyncio.timeout(QUERY_TIMEOUT):
-            while (results := await ld.get(path, pageSize=page_size))["status"] in RUNNING:
+            while (results := await client.get(path, pageSize=page_size))["status"] in RUNNING:
                 await asyncio.sleep(0.5)
     except BaseException as error:
         # Timed out, failed to poll or cancelled by the client: don't leave the query running in the warehouse.
         with contextlib.suppress(Exception):
             async with asyncio.timeout(CANCEL_TIMEOUT):
-                await ld.request("POST", f"{path}/cancel")
+                await client.request("POST", f"{path}/cancel")
         if isinstance(error, TimeoutError):
             raise ToolError(
                 f"The query took more than {QUERY_TIMEOUT} seconds and was cancelled."
@@ -137,10 +137,10 @@ def _table(results: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _explores(ld: LightdashClient, project_uuid: str) -> list[dict[str, Any]]:
+async def _explores(client: LightdashClient, project_uuid: str) -> list[dict[str, Any]]:
     # filtered=true applies the project's tables configuration, as Lightdash's own explore list does,
     # so the tables an admin hid in Lightdash stay hidden here too.
-    explores = await ld.get(f"/api/v1/projects/{project_uuid}/explores", filtered="true")
+    explores = await client.get(f"/api/v1/projects/{project_uuid}/explores", filtered="true")
     return [
         {
             "name": e["name"],
@@ -162,15 +162,15 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
     async def list_explores(project_uuid: Uuid) -> list[dict[str, Any]]:
         """List the explores of a project: the tables you can query, with what each one holds.
         Tables that the project's tables configuration hides are left out, as in Lightdash."""
-        async with lightdash(provider) as ld:
-            return await _explores(ld, project_uuid)
+        async with lightdash(provider) as client:
+            return await _explores(client, project_uuid)
 
     @server.tool(annotations=READ)
     async def get_explore(project_uuid: Uuid, explore: Name) -> dict[str, Any]:
         """List an explore's dimensions and metrics, joined tables included. Their field IDs go into run_query.
         Date dimensions come with one field per interval, such as orders_order_date_month."""
-        async with lightdash(provider) as ld:
-            found = await load_explore(ld, project_uuid, explore)
+        async with lightdash(provider) as client:
+            found = await load_explore(client, project_uuid, explore)
         base = found["tables"][found["baseTable"]]
         return {
             "name": found["name"],
@@ -202,8 +202,8 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         )
         if not dimensions and not metrics:
             raise ToolError("Give at least one dimension or metric.")
-        async with lightdash(provider) as ld:
-            found = await load_explore(ld, project_uuid, explore)
+        async with lightdash(provider) as client:
+            found = await load_explore(client, project_uuid, explore)
             known_dimensions, known_metrics = (
                 explore_fields(found, "dimensions"),
                 explore_fields(found, "metrics"),
@@ -246,7 +246,7 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                 "limit": rows + 1,
                 "tableCalculations": [],
             }
-            results = await _run(ld, project_uuid, "metric-query", {"query": query}, rows)
+            results = await _run(client, project_uuid, "metric-query", {"query": query}, rows)
         return _table(results)
 
     @server.tool(annotations=READ)
@@ -256,12 +256,14 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
         """Run a saved chart as it is saved: its fields, filters, sorts and row limit. chart_uuid is the chart's
         UUID or its slug. Give dashboard_uuid to apply that dashboard's filters too, as people see it on the
         dashboard. Returns at most 2500 rows; truncated is true when there are more."""
-        async with lightdash(provider) as ld:
-            chart_uuid = await resolve_chart(ld, project_uuid, chart_uuid)
+        async with lightdash(provider) as client:
+            chart_uuid = await resolve_chart(client, project_uuid, chart_uuid)
             if dashboard_uuid is None:
-                results = await _run(ld, project_uuid, "chart", {"chartUuid": chart_uuid}, MAX_ROWS)
+                results = await _run(
+                    client, project_uuid, "chart", {"chartUuid": chart_uuid}, MAX_ROWS
+                )
             else:
-                dashboard = await ld.get(f"/api/v1/dashboards/{dashboard_uuid}")
+                dashboard = await client.get(f"/api/v1/dashboards/{dashboard_uuid}")
                 if dashboard.get("projectUuid") != project_uuid:
                     raise ToolError("This dashboard is not in this project.")
                 tile = next(
@@ -281,5 +283,5 @@ def register(server: MCPServer, provider: LightdashOAuthProvider) -> None:
                     "dashboardFilters": dashboard["filters"],
                     "dashboardSorts": [],
                 }
-                results = await _run(ld, project_uuid, "dashboard-chart", body, MAX_ROWS)
+                results = await _run(client, project_uuid, "dashboard-chart", body, MAX_ROWS)
         return _table(results)

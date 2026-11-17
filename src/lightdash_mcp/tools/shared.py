@@ -26,11 +26,11 @@ def space_slug(space: dict[str, Any]) -> str:
     return space["path"].replace("_", "-").replace(".", "/")
 
 
-async def every_page(ld: LightdashClient, path: str, **params: Any) -> list[dict[str, Any]]:
+async def every_page(client: LightdashClient, path: str, **params: Any) -> list[dict[str, Any]]:
     """Every item of a paginated Lightdash list (`{"data": [...], "pagination": {...}}`)."""
     items: list[dict[str, Any]] = []
     for page in range(1, MAX_PAGES + 1):
-        results = await ld.get(path, pageSize=PAGE_SIZE, page=page, **params)
+        results = await client.get(path, pageSize=PAGE_SIZE, page=page, **params)
         items += results["data"]
         if page >= (results.get("pagination") or {}).get("totalPageCount", 0):
             return items

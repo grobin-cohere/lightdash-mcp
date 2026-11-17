@@ -203,8 +203,8 @@ async def test_tools_map_lightdash_errors(provider):
             )
         )
         with pytest.raises(ToolError, match="Permission denied.*Not allowed"):
-            async with lightdash(provider) as ld:
-                await ld.get("/api/v1/org")
+            async with lightdash(provider) as lightdash_client:
+                await lightdash_client.get("/api/v1/org")
 
         # Still refused with a refreshed token: Lightdash renewed the sign-in, so the 401 is about something else,
         # such as an Enterprise-only route or a proxy. The sign-in stays.
@@ -213,8 +213,8 @@ async def test_tools_map_lightdash_errors(provider):
             return_value=httpx.Response(401, json={"error": {"message": "No"}})
         )
         with pytest.raises(ToolError, match=r"Lightdash refused this request \(401\): No"):
-            async with lightdash(provider) as ld:
-                await ld.get("/api/v1/org")
+            async with lightdash(provider) as lightdash_client:
+                await lightdash_client.get("/api/v1/org")
         assert await provider.load_access_token(access)
         assert (await provider.store.get("grant", "grant", Grant)).access_token == "ld-access-2"
 
@@ -228,8 +228,8 @@ async def test_refresh_errors_read_the_same_before_and_during_a_call(provider):
         with pytest.raises(
             ToolError, match="Lightdash error 503 while refreshing your sign-in. Try again"
         ):
-            async with lightdash(provider) as ld:
-                await ld.get("/api/v1/org")
+            async with lightdash(provider) as lightdash_client:
+                await lightdash_client.get("/api/v1/org")
 
         await provider.store.put(
             "grant",
@@ -301,8 +301,8 @@ async def test_token_expiring_during_a_call_is_refreshed(provider):
                 httpx.Response(200, json={"results": {"name": "Org"}}),
             ]
         )
-        async with lightdash(provider) as ld:
-            assert await ld.get("/api/v1/org") == {"name": "Org"}
+        async with lightdash(provider) as lightdash_client:
+            assert await lightdash_client.get("/api/v1/org") == {"name": "Org"}
         assert org.calls[1].request.headers["Authorization"] == "Bearer ld-access-2"
         assert await provider.load_access_token(access) is not None
 
@@ -316,8 +316,8 @@ async def test_refused_refresh_during_a_call_ends_the_sign_in(provider):
         )
         respx.get(f"{LIGHTDASH}/api/v1/org").mock(return_value=httpx.Response(401))
         with pytest.raises(ToolError, match=RECONNECT):
-            async with lightdash(provider) as ld:
-                await ld.get("/api/v1/org")
+            async with lightdash(provider) as lightdash_client:
+                await lightdash_client.get("/api/v1/org")
         assert await provider.load_access_token(access) is None
 
 
@@ -949,5 +949,5 @@ async def test_tools_map_other_lightdash_failures(provider, answer, message):
 
     async with signed_in(provider, access):
         with pytest.raises(ToolError, match=re.escape(message)):
-            async with lightdash(provider) as ld:
-                await ld.get("/api/v1/org")
+            async with lightdash(provider) as lightdash_client:
+                await lightdash_client.get("/api/v1/org")
