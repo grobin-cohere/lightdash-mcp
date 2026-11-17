@@ -2,12 +2,12 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 import respx
 from cryptography.fernet import Fernet
-from fakeredis import FakeAsyncRedis
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AuthorizationParams, TokenError
@@ -34,26 +34,11 @@ from lightdash_mcp.auth.provider import (
     _consent_cookie,
 )
 from lightdash_mcp.auth.store import Store, digest
-from lightdash_mcp.config import Settings
 from lightdash_mcp.tools.common import BUSY, RECONNECT, lightdash
 
-LIGHTDASH = "http://lightdash.test"
-TOKEN_URL = f"{LIGHTDASH}/api/v1/oauth/token"
-REVOKE_URL = f"{LIGHTDASH}/api/v1/oauth/revoke"
-CLIENT = OAuthClientInformationFull(client_id="client", redirect_uris=["http://localhost:9999/callback"])
-REFRESHED = httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
+from .conftest import LIGHTDASH, REDIRECT, REFRESHED, REVOKE_URL, TOKEN_URL, token_response
 
-
-@pytest.fixture
-def provider() -> LightdashOAuthProvider:
-    settings = Settings(
-        _env_file=None,
-        lightdash_url=LIGHTDASH,
-        lightdash_client_id="id",
-        lightdash_client_secret="secret",
-        fernet_key=Fernet.generate_key().decode(),
-    )
-    return LightdashOAuthProvider(settings, Store(FakeAsyncRedis(), settings.fernet_key))
+CLIENT = OAuthClientInformationFull(client_id="client", redirect_uris=[REDIRECT])
 
 
 async def add_grant(provider: LightdashOAuthProvider, expires_in: float, grant_id: str = "grant", subject: str = "user") -> str:
@@ -79,8 +64,15 @@ async def refresh_of(provider: LightdashOAuthProvider, grant_id: str = "grant") 
     return await provider.load_refresh_token(CLIENT, f"our-refresh-{grant_id}")
 
 
-def signed_in_as(access: Access):
-    return auth_context_var.set(AuthenticatedUser(access))
+@asynccontextmanager
+async def signed_in(provider: LightdashOAuthProvider, access_token: str):
+    """Run the block as the user of `access_token`, as the SDK's bearer middleware does."""
+    access = await provider.load_access_token(access_token)
+    context = auth_context_var.set(AuthenticatedUser(access))
+    try:
+        yield
+    finally:
+        auth_context_var.reset(context)
 
 
 async def test_stored_values_are_encrypted(provider):
@@ -104,11 +96,7 @@ async def test_fresh_token_is_used_as_is(provider):
 @respx.mock
 async def test_concurrent_requests_refresh_once(provider):
     await add_grant(provider, 10)
-    route = respx.post(TOKEN_URL).mock(
-        return_value=httpx.Response(
-            200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600}
-        )
-    )
+    route = respx.post(TOKEN_URL).mock(return_value=token_response())
     tokens = await asyncio.gather(*(provider.lightdash_token("grant") for _ in range(5)))
     assert tokens == ["ld-access-2"] * 5
     assert route.call_count == 1
@@ -187,8 +175,7 @@ async def test_refused_upstream_revocation_is_logged(provider, caplog):
 @respx.mock
 async def test_tools_map_lightdash_errors(provider):
     access = await add_grant(provider, 3600)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
+    async with signed_in(provider, access):
         respx.get(f"{LIGHTDASH}/api/v1/org").mock(
             return_value=httpx.Response(403, json={"status": "error", "error": {"message": "Not allowed"}})
         )
@@ -205,15 +192,12 @@ async def test_tools_map_lightdash_errors(provider):
                 await ld.get("/api/v1/org")
         assert await provider.load_access_token(access)
         assert (await provider.store.get("grant", "grant", Grant)).access_token == "ld-access-2"
-    finally:
-        auth_context_var.reset(reset)
 
 
 @respx.mock
 async def test_refresh_errors_read_the_same_before_and_during_a_call(provider):
     access = await add_grant(provider, 3600)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
+    async with signed_in(provider, access):
         respx.post(TOKEN_URL).mock(return_value=httpx.Response(503))
         respx.get(f"{LIGHTDASH}/api/v1/org").mock(return_value=httpx.Response(401))
         with pytest.raises(ToolError, match="Lightdash error 503 while refreshing your sign-in. Try again"):
@@ -227,15 +211,12 @@ async def test_refresh_errors_read_the_same_before_and_during_a_call(provider):
             async with lightdash(provider):
                 pass
         assert await provider.load_access_token(access)
-    finally:
-        auth_context_var.reset(reset)
 
 
 @respx.mock
 async def test_malformed_refresh_answer_is_a_retryable_tool_error(provider):
     access = await add_grant(provider, 10)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
+    async with signed_in(provider, access):
         for answer in (
             httpx.Response(200, json={"access_token": "only"}),
             httpx.Response(200, text="<html>"),
@@ -246,8 +227,6 @@ async def test_malformed_refresh_answer_is_a_retryable_tool_error(provider):
                 async with lightdash(provider):
                     pass
         assert (await provider.store.get("grant", "grant", Grant)).refresh_token == "ld-refresh-grant"
-    finally:
-        auth_context_var.reset(reset)
 
 
 async def test_a_lock_finds_its_own_token_after_a_lost_answer(provider, monkeypatch):
@@ -267,26 +246,17 @@ def test_the_grant_lock_outlasts_a_refresh_and_its_redis_commands():
 async def test_a_refresh_lock_held_too_long_is_a_retryable_tool_error(provider, monkeypatch):
     monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
     access = await add_grant(provider, 10)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
-        async with provider.store.lock("grant", "grant"):
-            with pytest.raises(ToolError, match=BUSY):
-                async with lightdash(provider):
-                    pass
-    finally:
-        auth_context_var.reset(reset)
+    async with signed_in(provider, access), provider.store.lock("grant", "grant"):
+        with pytest.raises(ToolError, match=BUSY):
+            async with lightdash(provider):
+                pass
 
 
 @respx.mock
 async def test_token_expiring_during_a_call_is_refreshed(provider):
     access = await add_grant(provider, 3600)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
-        respx.post(TOKEN_URL).mock(
-            return_value=httpx.Response(
-                200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600}
-            )
-        )
+    async with signed_in(provider, access):
+        respx.post(TOKEN_URL).mock(return_value=token_response())
         org = respx.get(f"{LIGHTDASH}/api/v1/org").mock(
             side_effect=[httpx.Response(401), httpx.Response(200, json={"results": {"name": "Org"}})]
         )
@@ -294,23 +264,18 @@ async def test_token_expiring_during_a_call_is_refreshed(provider):
             assert await ld.get("/api/v1/org") == {"name": "Org"}
         assert org.calls[1].request.headers["Authorization"] == "Bearer ld-access-2"
         assert await provider.load_access_token(access) is not None
-    finally:
-        auth_context_var.reset(reset)
 
 
 @respx.mock
 async def test_refused_refresh_during_a_call_ends_the_sign_in(provider):
     access = await add_grant(provider, 3600)
-    reset = signed_in_as(await provider.load_access_token(access))
-    try:
+    async with signed_in(provider, access):
         respx.post(TOKEN_URL).mock(return_value=httpx.Response(400, json={"error": "invalid_grant"}))
         respx.get(f"{LIGHTDASH}/api/v1/org").mock(return_value=httpx.Response(401))
         with pytest.raises(ToolError, match=RECONNECT):
             async with lightdash(provider) as ld:
                 await ld.get("/api/v1/org")
         assert await provider.load_access_token(access) is None
-    finally:
-        auth_context_var.reset(reset)
 
 
 async def test_tools_require_a_sign_in(provider):
@@ -451,7 +416,7 @@ async def test_revoke_waits_for_a_refresh_in_flight(provider):
     async def slow_refresh(request):
         refreshing.set()
         await finish.wait()
-        return httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
+        return token_response()
 
     respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
     revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
@@ -474,7 +439,7 @@ async def test_failed_callback_returns_to_the_client(provider):
             state="client-state",
             scopes=[],
             code_challenge="x" * 43,
-            redirect_uri="http://localhost:9999/callback",
+            redirect_uri=REDIRECT,
             redirect_uri_provided_explicitly=True,
         ),
         verifier="verifier",
@@ -494,7 +459,7 @@ async def test_failed_callback_returns_to_the_client(provider):
     )
     response = await provider.lightdash_callback(request)
     assert response.status_code == 302
-    assert response.headers["location"].startswith("http://localhost:9999/callback?error=server_error")
+    assert response.headers["location"].startswith(f"{REDIRECT}?error=server_error")
 
 
 @respx.mock
@@ -504,7 +469,7 @@ async def test_slow_refresh_gives_up_before_the_lock_expires(provider, monkeypat
 
     async def slow_refresh(request):
         await asyncio.sleep(1)
-        return httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
+        return token_response()
 
     respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
     with pytest.raises(RefreshFailed, match="in time"):
@@ -515,14 +480,13 @@ async def test_slow_refresh_gives_up_before_the_lock_expires(provider, monkeypat
 
 @respx.mock
 async def test_grant_lasts_once_its_code_is_exchanged(provider):
-    client = OAuthClientInformationFull(client_id="client", redirect_uris=["http://localhost:9999/callback"])
     transaction = Transaction(
         client_id="client",
         params=AuthorizationParams(
             state=None,
             scopes=[],
             code_challenge="x" * 43,
-            redirect_uri="http://localhost:9999/callback",
+            redirect_uri=REDIRECT,
             redirect_uri_provided_explicitly=True,
         ),
         verifier="verifier",
@@ -530,9 +494,7 @@ async def test_grant_lasts_once_its_code_is_exchanged(provider):
         approved=True,
     )
     await provider.store.put("transaction", "t", transaction)
-    respx.post(TOKEN_URL).mock(
-        return_value=httpx.Response(200, json={"access_token": "ld-access", "refresh_token": "ld-refresh", "expires_in": 3600})
-    )
+    respx.post(TOKEN_URL).mock(return_value=token_response("ld-access", "ld-refresh"))
     respx.get(f"{LIGHTDASH}/api/v1/user").mock(return_value=httpx.Response(200, json={"results": {"userUuid": "user"}}))
     request = Request(
         {
@@ -544,12 +506,13 @@ async def test_grant_lasts_once_its_code_is_exchanged(provider):
         }
     )
     response = await provider.lightdash_callback(request)
-    code = await provider.load_authorization_code(client, response.headers["location"].split("code=")[1])
+    issued_code = response.headers["location"].split("code=")[1]
+    code = await provider.load_authorization_code(CLIENT, issued_code)
     grant_key = f"lightdash-mcp:grant:{code.grant_id}"
     # A sign-in whose code is never exchanged doesn't keep the Lightdash tokens for long.
     assert 0 < await provider.store._redis.ttl(grant_key) <= TRANSACTION_TTL
 
-    await provider.exchange_authorization_code(client, code)
+    await provider.exchange_authorization_code(CLIENT, code)
     assert await provider.store._redis.ttl(grant_key) > REFRESH_TTL - 60
 
 
@@ -605,7 +568,7 @@ async def test_a_refresh_token_used_twice_ends_the_sign_in(provider, caplog):
     assert await provider.load_access_token(issued.access_token)
 
     # Another client presenting it is refused, and changes nothing.
-    other = OAuthClientInformationFull(client_id="other", redirect_uris=["http://localhost:9999/callback"])
+    other = OAuthClientInformationFull(client_id="other", redirect_uris=[REDIRECT])
     assert await provider.load_refresh_token(other, refresh.token) is None
     assert await provider.load_access_token(issued.access_token)
 
@@ -684,7 +647,7 @@ async def test_consent_page_shows_where_the_user_returns(provider):
 
 
 async def test_approved_consent_cannot_be_reopened_in_another_browser(provider):
-    await consent_page(provider, "http://localhost:9999/callback")
+    await consent_page(provider, REDIRECT)
     transaction_id = (await provider.store._redis.keys("lightdash-mcp:transaction:*"))[0].decode().rsplit(":", 1)[1]
     transaction = await provider.store.get("transaction", transaction_id, Transaction)
     transaction.approved = True
@@ -700,10 +663,10 @@ async def test_approved_consent_cannot_be_reopened_in_another_browser(provider):
 
 
 async def test_consent_cookie_is_secure_behind_an_https_public_url(provider):
-    _, cookie = await consent_page(provider, "http://localhost:9999/callback")
+    _, cookie = await consent_page(provider, REDIRECT)
     assert "secure" not in cookie.lower()
     provider.settings.public_url = "https://mcp.example.com"
-    _, cookie = await consent_page(provider, "http://localhost:9999/callback")
+    _, cookie = await consent_page(provider, REDIRECT)
     assert "secure" in cookie.lower()
 
 

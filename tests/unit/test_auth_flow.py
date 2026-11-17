@@ -5,30 +5,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import pytest
 import respx
-from cryptography.fernet import Fernet
-from fakeredis import FakeAsyncRedis
 from mcp.server.auth.provider import AuthorizationParams, AuthorizeError, RegistrationError
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 
 from lightdash_mcp.auth.provider import LightdashOAuthProvider, Transaction, _consent_cookie
-from lightdash_mcp.auth.store import Store
-from lightdash_mcp.config import Settings
 
-LIGHTDASH = "http://lightdash.test"
-REDIRECT = "http://localhost:9999/callback"
-
-
-@pytest.fixture
-def provider() -> LightdashOAuthProvider:
-    settings = Settings(
-        _env_file=None,
-        lightdash_url=LIGHTDASH,
-        lightdash_client_id="id",
-        lightdash_client_secret="secret",
-        fernet_key=Fernet.generate_key().decode(),
-    )
-    return LightdashOAuthProvider(settings, Store(FakeAsyncRedis(), settings.fernet_key))
+from .conftest import LIGHTDASH, REDIRECT, TOKEN_URL
 
 
 def request(path: str, query: dict | None = None, cookies: dict | None = None, form: dict | None = None) -> Request:
@@ -235,7 +218,7 @@ async def test_a_failed_lightdash_sign_in_returns_to_the_client(provider):
     transaction_id, csrf = await start(provider)
     transaction = await provider.store.get("transaction", transaction_id, Transaction)
     await provider.store.put("transaction", transaction_id, transaction.model_copy(update={"approved": True}))
-    respx.post(f"{LIGHTDASH}/api/v1/oauth/token").mock(return_value=httpx.Response(200, json={"access_token": "only"}))
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "only"}))
     response = await provider.lightdash_callback(
         request("/oauth/lightdash/callback", {"state": transaction_id, "code": "c"}, {_consent_cookie(transaction_id): csrf})
     )

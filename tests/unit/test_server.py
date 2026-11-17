@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 from redis.asyncio.client import Pipeline
 from redis.asyncio.lock import Lock
@@ -25,28 +24,15 @@ from lightdash_mcp.auth.store import Store, digest
 from lightdash_mcp.config import Settings
 from lightdash_mcp.server import asgi_app, audit, create_server
 
-LIGHTDASH = "http://lightdash.test"
-TOKEN_URL = f"{LIGHTDASH}/api/v1/oauth/token"
-REVOKE_URL = f"{LIGHTDASH}/api/v1/oauth/revoke"
-REDIRECT = "http://localhost:9999/callback"
+from .conftest import REDIRECT, REFRESHED, REVOKE_URL, TOKEN_URL, make_settings
+
 VERIFIER = "v" * 64
-REFRESHED = httpx.Response(200, json={"access_token": "ld-access-2", "refresh_token": "ld-refresh-2", "expires_in": 3600})
 
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(
-        _env_file=None,
-        lightdash_url=LIGHTDASH,
-        lightdash_client_id="id",
-        lightdash_client_secret="lightdash-secret",
-        fernet_key=Fernet.generate_key().decode(),
-    )
-
-
-@pytest.fixture
-def redis() -> FakeAsyncRedis:
-    return FakeAsyncRedis()
+    # A secret of its own, so the audit log test can look for it.
+    return make_settings(lightdash_client_secret="lightdash-secret")
 
 
 @pytest.fixture
