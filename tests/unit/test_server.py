@@ -12,6 +12,9 @@ import pytest
 import respx
 from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
+from redis.asyncio.client import Pipeline
+from redis.asyncio.lock import Lock
+from redis.exceptions import ConnectionError
 
 from lightdash_mcp import server as server_module
 from lightdash_mcp.auth import store as store_module
@@ -262,6 +265,109 @@ async def test_a_refresh_that_outlasts_the_lock_still_returns_its_tokens(http, s
     assert refreshed.status_code == 200, refreshed.text
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
     assert (await refresh(http, client, refreshed.json()["refresh_token"])).status_code == 200
+
+
+def fail(monkeypatch: pytest.MonkeyPatch, target: object, name: str) -> None:
+    async def down(*args, **kwargs):
+        raise ConnectionError("Redis is down")
+
+    monkeypatch.setattr(target, name, down)
+
+
+# Every command, or only the transactions: a token write, or a grant's end.
+OUTAGES = {"everything": "execute_command", "transactions": None}
+
+
+def outage(monkeypatch: pytest.MonkeyPatch, redis: FakeAsyncRedis, which: str) -> None:
+    if OUTAGES[which]:
+        fail(monkeypatch, redis, OUTAGES[which])
+    fail(monkeypatch, Pipeline, "execute")
+
+
+@pytest.mark.parametrize("which", OUTAGES)
+@respx.mock
+async def test_a_refresh_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch, caplog, which):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    with monkeypatch.context() as down:
+        outage(down, redis, which)
+        failed = await refresh(http, client, tokens["refresh_token"])
+    assert retryable(failed), failed.text
+    assert failed.headers["cache-control"] == "no-store"
+    assert '"storage_failed"' in caplog.text
+    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant and grant.refresh_digest == digest(tokens["refresh_token"])
+    assert (await refresh(http, client, tokens["refresh_token"])).status_code == 200
+
+
+async def test_a_code_exchange_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch):
+    client = await register(http)
+    code = await add_code(settings, redis, client)
+    with monkeypatch.context() as down:
+        outage(down, redis, "everything")
+        failed = await exchange(http, client, code)
+    assert retryable(failed), failed.text
+    assert (await exchange(http, client, code)).status_code == 200
+
+
+async def test_a_code_whose_tokens_failed_to_save_is_spent(http, settings, redis, monkeypatch):
+    client = await register(http)
+    code = await add_code(settings, redis, client)
+    with monkeypatch.context() as down:
+        outage(down, redis, "transactions")
+        failed = await exchange(http, client, code)
+    # Answered as any outage, but the code was taken before the write failed: the user signs in again.
+    assert retryable(failed), failed.text
+    spent = await exchange(http, client, code)
+    assert (spent.status_code, spent.json()["error"]) == (400, "invalid_grant")
+
+
+@pytest.mark.parametrize("which", OUTAGES)
+@respx.mock
+async def test_a_revocation_during_a_redis_outage_can_be_retried(http, settings, redis, monkeypatch, which):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    lightdash = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
+    form = {"token": tokens["access_token"], **credentials(client)}
+
+    with monkeypatch.context() as down:
+        outage(down, redis, which)
+        failed = await http.post("/revoke", data=form)
+    assert failed.status_code == 503, failed.text
+    assert failed.headers["retry-after"] == "5"
+    assert failed.json()["error"] == "temporarily_unavailable"
+    assert not lightdash.called
+    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant and grant.access_digest == digest(tokens["access_token"])
+
+    assert (await http.post("/revoke", data=form)).status_code == 200
+    assert await Store(redis, settings.fernet_key).get("grant", "grant", Grant) is None
+
+
+@pytest.mark.parametrize("failing", [(Lock, "do_release"), (FakeAsyncRedis, "expire")], ids=["lock release", "client renewal"])
+@respx.mock
+async def test_a_refresh_saved_before_redis_fails_still_returns_its_tokens(http, settings, redis, monkeypatch, failing):
+    client = await register(http)
+    tokens = (await exchange(http, client, await add_code(settings, redis, client))).json()
+    respx.post(TOKEN_URL).mock(return_value=REFRESHED)
+
+    with monkeypatch.context() as down:
+        fail(down, *failing)
+        refreshed = await refresh(http, client, tokens["refresh_token"])
+    # The old refresh token is rotated by then: an error would leave the client with neither.
+    assert refreshed.status_code == 200, refreshed.text
+    grant = await Store(redis, settings.fernet_key).get("grant", "grant", Grant)
+    assert grant and grant.refresh_digest == digest(refreshed.json()["refresh_token"])
+
+
+async def test_a_redis_outage_elsewhere_is_still_a_server_error(settings, redis, monkeypatch):
+    transport = httpx.ASGITransport(asgi_app(settings, redis), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as http:
+        fail(monkeypatch, redis, "execute_command")
+        consent = await http.get("/oauth/consent", params={"transaction": "t"})
+    assert consent.status_code == 500
 
 
 async def test_large_token_bodies_are_refused_before_they_are_read(http):

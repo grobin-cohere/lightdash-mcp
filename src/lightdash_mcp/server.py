@@ -1,5 +1,6 @@
 import base64
 import binascii
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -27,7 +28,8 @@ from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
 REDIS_TIMEOUT = 5  # seconds: a Redis that stops answering fails a request instead of hanging it
-RETRY_AFTER = 5  # seconds, for a /revoke that found the grant's lock busy
+RETRY_AFTER = 5  # seconds, for a /revoke that Redis or the grant's lock kept from finishing
+UNAVAILABLE = "This server's storage didn't answer. Try again in a moment."
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # as the SDK's token endpoint answers
 
 
@@ -153,22 +155,27 @@ def _basic_credentials(authorization: str) -> tuple[str, str] | None:
     return (unquote(client_id), unquote(secret)) if separator and client_id else None
 
 
-async def busy(request: Request, error: Exception) -> Response:
-    """A grant's lock stayed busy where the SDK catches no error: in /revoke, and in /token's reuse check of a refresh
-    token, which ends the grant. The exchanges themselves answer a busy lock with a TokenError."""
+async def try_again(request: Request, error: Exception) -> Response:
+    """Redis failed or didn't answer in /token or /revoke, or a grant's lock stayed busy where the SDK catches no error:
+    in /revoke, and in /token's reuse check of a refresh token, which ends the grant. The exchanges themselves answer a
+    busy lock with a TokenError. Other paths keep the error, and a 500."""
+    if request.url.path not in ("/token", "/revoke"):
+        raise error
+    busy = isinstance(error, LockError)
+    if not busy:
+        record("storage_failed", logging.WARNING, path=request.url.path, error=type(error).__name__)
+    description = BUSY if busy else UNAVAILABLE
     if request.url.path == "/token":
-        content = TokenErrorResponse(error=RETRY_ERROR, error_description=BUSY)
+        content = TokenErrorResponse(error=RETRY_ERROR, error_description=description)
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
-    if request.url.path == "/revoke":
-        # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
-        content = {"error": "temporarily_unavailable", "error_description": BUSY}
-        return JSONResponse(content, status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
-    raise error
+    # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
+    content = {"error": "temporarily_unavailable", "error_description": description}
+    return JSONResponse(content, status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
 
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
     app = create_server(settings, redis).streamable_http_app(transport_security=transport_security(settings), host=settings.host)
-    app.add_exception_handler(LockError, busy)
+    app.add_exception_handler(RedisError, try_again)  # LockError too
     return BasicAuthClientId(app)
 
 

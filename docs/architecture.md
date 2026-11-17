@@ -6,7 +6,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 
 | Module | Owns |
 | --- | --- |
-| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the tool-call audit log, allowed hosts, the Basic-header fix on `/token` and `/revoke`, and their answer to a busy grant lock |
+| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the tool-call audit log, allowed hosts, the Basic-header fix on `/token` and `/revoke`, and their answer to a Redis failure or a busy grant lock |
 | `config.py` | Settings from the environment |
 | `auth/provider.py` | The OAuth provider: clients, consent, Lightdash callback, codes and tokens, upstream refresh |
 | `auth/pages.py` | The consent and error pages |
@@ -60,7 +60,8 @@ Registration is open, as MCP clients need, so it checks what it stores:
 - A refresh token works once. Its digest is kept for 14 days after its exchange: presented again by its client, it was copied, and the grant ends, here and on Lightdash. A second refresh still in flight with the same token is only refused.
 - When Lightdash refuses a refresh with `invalid_grant`, the grant ends and the user signs in again. Any other error, such as `invalid_client` from a wrong client secret, a malformed answer, or Lightdash being unreachable, keeps the grant and the client's refresh token so it can retry.
 - Revoking a token ends the grant here and revokes its refresh token on Lightdash, with this server's Lightdash client credentials. A refusal or a failure there is logged. The revocation waits for a refresh in flight on the same grant, so the refresh can't bring the grant back or issue tokens after it.
-- A lock that expires before its holder releases it is not an error: the work under it is saved by then. For a refresh, an error would hide new tokens that have already replaced the old ones.
+- Ending a grant deletes it and its tokens in one Redis transaction too.
+- A lock that expires before its holder releases it, or that Redis fails to release, is not an error: the work under it is saved by then, and a lock left behind expires after its 30 seconds. For a refresh, an error would hide new tokens that have already replaced the old ones. For the same reason, a failure to renew the client registration's expiry after an exchange is ignored.
 
 ### When `/token` or `/revoke` can't finish for now
 
@@ -70,12 +71,24 @@ Registration is open, as MCP clients need, so it checks what it stores:
 | The grant's lock stays busy for 30 seconds, during a code or refresh exchange | `/token`: 400 `invalid_request`, "Try again in a moment." | The grant, and the code or refresh token |
 | The lock stays busy while a reused refresh token is found | `/token`: the same 400 `invalid_request`. The grant ends when the token is presented again | The grant, until then |
 | The lock stays busy during a revocation | `/revoke`: 503, `Retry-After: 5` | The grant and its tokens |
+| Redis fails or doesn't answer in 5 seconds (`REDIS_TIMEOUT`), anywhere in `/token`: the client lookup, loading the code or refresh token, the exchange | `/token`: 400 `invalid_request`, "This server's storage didn't answer. Try again in a moment." | The grant, and the refresh token. The code too, unless it failed after the code was taken (below) |
+| Redis fails or doesn't answer anywhere in `/revoke` | `/revoke`: 503, `Retry-After: 5` | The grant and its tokens, unless only the answer to the transaction that ends the grant was lost (below) |
 
 Why `invalid_request` on `/token`: RFC 6749 section 5.2 has no `server_error` or `temporarily_unavailable` code for the token endpoint, and the MCP SDK fails with a 500 on any code outside RFC 6749's. Of the codes it allows, `invalid_grant` tells clients that the session has ended, so they drop it and sign in again. `invalid_client` and `unauthorized_client` make some clients drop their registration. `invalid_request` says nothing about the grant or the client, so a client can retry with the same code or refresh token.
 
 Why 503 on `/revoke`: RFC 7009 section 2.2.1 says that after a 503 the client must assume the token still works, and may try again later. Ending the grant without its lock would let the exchange in flight bring the grant back.
 
-The SDK catches errors only around the code and refresh exchanges. A busy lock elsewhere in `/token` (the reuse check) or in `/revoke` reaches `busy` in `server.py`, which gives the answers above.
+The SDK catches errors only around the code and refresh exchanges, and only `TokenError`. A Redis error in `/token` or `/revoke`, or a busy lock outside the exchanges (the reuse check, a revocation), reaches `try_again` in `server.py`, which gives the answers above and logs `storage_failed` for a Redis error. The provider can't answer them itself: the client lookup and the loads can only return nothing, which the SDK answers with `invalid_grant`. A Redis error on any other path is still a 500.
+
+#### What a Redis failure can still cost
+
+Most of these steps only read, or change nothing until the transaction that writes the new tokens. That transaction succeeds or fails as a whole, so when Redis fails before or during it, the client retries with what it has. The cases left are failures where Redis did some of the work before the error:
+
+- **The answer to a transaction is lost, but Redis applied it.** The Redis client retries a command after a connection error or a timeout, up to 10 times, and gives up with an error. A transaction that writes new tokens may have been applied, though the client never gets the tokens. On a refresh, the client's retry presents the old refresh token, which now reads as reused: the grant ends, here and on Lightdash, and the user signs in again. On a code exchange, the code is spent (next case). Nobody holds the lost tokens, so nothing leaks. When a transaction that ends a grant is applied, `/revoke` still answers 503. The client's retry gets 200, but the grant's Lightdash refresh token isn't revoked: it was deleted with the grant.
+- **A code exchange fails after it takes the code.** The code is taken (`GETDEL`) before the tokens are written, so that it can't be used twice even by an exchange whose lock expired. When the write then fails, the client's retry gets `invalid_grant` ("authorization code does not exist"), and the user signs in again. When Redis applied the `GETDEL` but its answer was lost, the Redis client's retry finds the code gone, and that exchange itself gets `invalid_grant`.
+- **Saving the new Lightdash tokens fails.** Lightdash rotates its refresh token before this server saves the new one. When the save fails, the grant keeps a Lightdash refresh token that no longer works. The client keeps its own, but its retry gets `invalid_grant` from Lightdash, and the user signs in again.
+
+Once the new tokens are written, a Redis failure can't fail the request any more (see the lock bullet above).
 
 ## Storage
 
@@ -119,6 +132,7 @@ The `lightdash_mcp.audit` logger writes one JSON object per line, so a value sen
 | `token_revoked` | A client revokes a token | `grant`, `subject`, `client_id` |
 | `grant_ended` | A grant ends | `grant`, `subject`, `client_id`, `reason`: `revoked`, `lightdash_refused_refresh` or `refresh_token_reused` |
 | `lightdash_revoke_failed` | Lightdash refuses or misses a revocation, at WARNING | `grant`, `subject`, `failure` (status or error) |
+| `storage_failed` | Redis fails or doesn't answer during `/token` or `/revoke`, at WARNING | `path`, `error` (the Redis error's class) |
 
 ```
 {"event": "tool_call", "user": "b264d83a-9000-426a-85ec-3f9c20f368ce", "tool": "revoke_project_access", "arguments": {"project_uuid": "3675b69e-...", "user_uuid": "...", "dry_run": false}, "error": false}

@@ -8,6 +8,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
+from redis.exceptions import RedisError
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -76,11 +77,24 @@ class Store:
         await self._redis.aclose()
 
     def lock(self, kind: str, key: str) -> Lock:
-        """Raises LockError when it stays busy for LOCK_TIMEOUT. Not when it expired before its release: the work under
-        it is done by then, and an error would hide it, such as tokens that were already rotated."""
+        """Raises LockError when it stays busy for LOCK_TIMEOUT. Not when it expired before its release, or when Redis
+        fails the release: the work under it is done by then, and an error would hide it, such as tokens that were
+        already rotated. A lock left behind expires after LOCK_TIMEOUT."""
         return self._redis.lock(
-            self._key(f"lock:{kind}", key), timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_TIMEOUT, raise_on_release_error=False
+            self._key(f"lock:{kind}", key),
+            timeout=LOCK_TIMEOUT,
+            blocking_timeout=LOCK_TIMEOUT,
+            lock_class=_ReleasedOrExpiring,
+            raise_on_release_error=False,
         )
+
+
+class _ReleasedOrExpiring(Lock):
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            await super().__aexit__(exc_type, exc_value, traceback)
+        except RedisError:
+            pass
 
 
 def _ttl(ttl: int | None) -> int | None:
