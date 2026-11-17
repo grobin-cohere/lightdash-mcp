@@ -42,15 +42,16 @@ Copy `.env.example` to `.env` and fill it in.
 
 | Variable | Required | Default | What it does |
 | --- | --- | --- | --- |
-| `LIGHTDASH_URL` | No | `http://localhost:8080` | The Lightdash instance |
+| `LIGHTDASH_URL` | No | `http://localhost:8080` | The Lightdash instance, an `http` or `https` address |
 | `LIGHTDASH_CLIENT_ID` | Yes | | The OAuth client from the step above |
 | `LIGHTDASH_CLIENT_SECRET` | Yes | | Its secret |
 | `FERNET_KEY` | Yes | | Encrypts everything stored in Redis |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Where sign-ins, clients and tokens are kept |
-| `HOST` | No | `127.0.0.1` | Address the server listens on |
+| `REDIS_URL` | No | `redis://localhost:6379/0` | Where sign-ins, clients and tokens are kept. With a password: `redis://:<password>@127.0.0.1:6380/0`. See [Redis](#redis) |
+| `HOST` | No | `127.0.0.1` (`0.0.0.0` in the Docker image) | Address the server listens on. See [Docker](#docker) |
 | `PORT` | No | `8000` | Port the server listens on |
-| `PUBLIC_URL` | No | `http://localhost:<PORT>` | The address clients reach this server at, as in [Behind a proxy or a tunnel](#behind-a-proxy-or-a-tunnel). It is the OAuth issuer, and its host is accepted on incoming requests |
+| `PUBLIC_URL` | No | `http://localhost:<PORT>` | The address clients reach this server at, as in [Behind a proxy or a tunnel](#behind-a-proxy-or-a-tunnel). It is the OAuth issuer, and its host is accepted on incoming requests. It must be `https`, unless its host is `localhost`, `127.0.0.1` or `[::1]`, and at the root of its host |
 | `ACCESS_TOKEN_TTL` | No | `3600` | Seconds an access token issued to MCP clients lasts, from 60 to 1209600 (14 days). Raise it for clients that never refresh their token, such as Dex's OAuth connector: with the default they get 401 an hour after signing in |
+| `REDIRECT_HOSTS` | No | Any host | Comma-separated hosts, such as `dex.example.com,claude.ai`. When set, clients can register `https` redirect URIs on these hosts only, and the consent page doesn't warn about them. Loopback `http` and app redirect URIs are always accepted |
 
 Generate a `FERNET_KEY`:
 
@@ -58,7 +59,11 @@ Generate a `FERNET_KEY`:
 uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-The server stops with `Missing settings: ...` when a required variable is empty.
+The server stops with `Missing settings: ...` when a required variable is empty, and with a message naming the variable when `LIGHTDASH_URL` or `PUBLIC_URL` isn't a valid address. It logs a warning when `PUBLIC_URL` is `https` and `HOST` isn't a loopback address: the server then also answers plain HTTP on that address, around the HTTPS proxy.
+
+A sign-in lasts at most 90 days, then the user signs in again. A client registration expires 30 days after its last token exchange.
+
+After an upgrade from 0.3.0 or earlier, every user signs in again once: the records in Redis now name their own key, and older ones count as missing.
 
 ## Run
 
@@ -67,13 +72,34 @@ uv sync
 uv run lightdash-mcp
 ```
 
-Or with Docker, which listens on `0.0.0.0` inside the container:
+### Docker
+
+The image sets `HOST=0.0.0.0`: inside a container, the server must listen on every interface for a published port to reach it.
 
 ```bash
-docker run --env-file .env -p 8000:8000 ghcr.io/grobin-cohere/lightdash-mcp
+docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp
 ```
 
 Inside the container, `localhost` is the container itself. Point `REDIS_URL` at an address the container can reach, such as `redis://host.docker.internal:6379/0` for Redis on the host. `LIGHTDASH_URL` must be reachable from both the container and your browser, which signs in there.
+
+With `network_mode: host`, the container shares the machine's interfaces, so `HOST=0.0.0.0` exposes the server, over plain HTTP, on every address of the machine. Set `HOST=127.0.0.1` and let the proxy on the machine, such as Tailscale serve, reach it there:
+
+```yaml
+services:
+  lightdash-mcp:
+    image: ghcr.io/grobin-cohere/lightdash-mcp
+    network_mode: host
+    env_file: .env
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8001
+      PUBLIC_URL: https://lightdash-mcp.example.ts.net
+      REDIS_URL: redis://:<password>@127.0.0.1:6380/0
+```
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8001
+```
 
 The MCP endpoint is `<PUBLIC_URL>/mcp`, over Streamable HTTP.
 
@@ -111,8 +137,21 @@ Set `PUBLIC_URL` to the address the tunnel prints, such as `https://abc.trycloud
 ## Run it publicly
 
 - Serve it over HTTPS behind a reverse proxy, as above.
-- Rate-limit `/register`, `/authorize` and `/token` at the proxy. Registration is open, as MCP clients need, and each registration or sign-in request is kept in Redis: registrations 30 days after their last use, sign-in requests 10 minutes.
+- Rate-limit `/register`, `/authorize` and `/token` at the proxy when it can. Registration is open, as MCP clients need, and each registration or sign-in request is kept in Redis: registrations 30 days after their last token exchange, sign-in requests 10 minutes. The server limits the size of each (as in [What registration accepts](architecture.md#what-registration-accepts)), but not their number. Tailscale serve can't rate-limit: there, these limits and the Redis settings below are what protect Redis.
+- Set `REDIRECT_HOSTS` to the hosts of the web clients you use, such as Dex or claude.ai, so no one can register a client that sends codes to another website.
 - Keep Redis private, and `FERNET_KEY` and `LIGHTDASH_CLIENT_SECRET` out of the repository.
+
+### Redis
+
+Anyone who can write to Redis can end sign-ins, or fill it. Values are encrypted and tied to their keys, so they can't read tokens or move a sign-in to another user, but:
+
+- Give Redis a password (`requirepass`, or an ACL user), put it in `REDIS_URL`, and listen on `127.0.0.1` only.
+- Cap its memory, so unauthenticated registrations can't fill the machine: `maxmemory 256mb` with `maxmemory-policy volatile-ttl`. Every key this server writes has a TTL, and `volatile-ttl` drops those closest to expiry first, such as sign-in requests.
+- The server gives up on a Redis request after 5 seconds, so a Redis that stops answering fails requests instead of hanging them.
+
+```bash
+redis-server --bind 127.0.0.1 --port 6380 --requirepass '<password>' --maxmemory 256mb --maxmemory-policy volatile-ttl
+```
 
 ## Connect a client
 
@@ -123,6 +162,6 @@ Set `PUBLIC_URL` to the address the tunnel prints, such as `https://abc.trycloud
 | Claude.ai | Add a custom connector with `<PUBLIC_URL>/mcp`. Claude.ai needs a public HTTPS address |
 | ChatGPT | In developer mode, add a connector with `<PUBLIC_URL>/mcp` and OAuth. ChatGPT needs a public HTTPS address |
 
-On first use, the client opens a consent page on this server that names the client and where it returns to. After **Allow**, Lightdash asks the user to sign in and approve, then the client is connected.
+On first use, the client opens a consent page on this server that names the client and shows the address it returns to, with a warning when that address is a website or an app rather than this computer. After **Allow**, Lightdash asks the user to sign in and approve, then the client is connected.
 
 To connect Claude.ai or ChatGPT to a local server, run a [tunnel](#tunnel).

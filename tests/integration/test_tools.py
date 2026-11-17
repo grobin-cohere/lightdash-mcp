@@ -73,12 +73,13 @@ async def test_read_tools(admin, tool, project_uuid):
 
     roles = ok(await tool(admin, "list_roles"))
     assert {"Admin", "Viewer"} <= {r["name"] for r in roles}
+    assert all(r["scopes"] for r in roles if r["name"] == "Viewer")
 
     access = ok(await tool(admin, "list_project_access", {"project_uuid": project_uuid}))
     assert any(u["email"] == "demo@lightdash.com" and u["projectRole"] == "admin" for u in access["users"])
 
     spaces = ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
-    assert spaces
+    assert spaces and all(s["spaceSlug"] for s in spaces)
     space_access = ok(
         await tool(admin, "list_space_access", {"project_uuid": project_uuid, "space_uuid": spaces[0]["spaceUuid"]})
     )
@@ -96,7 +97,9 @@ async def test_permissions_follow_the_user(admin, viewer, tool, project_uuid, ed
     assert "Permission denied" in denied(await tool(viewer, "list_roles"))
     assert "Permission denied" in denied(await tool(viewer, "list_schedulers", {"project_uuid": project_uuid}))
     message = denied(
-        await tool(viewer, "grant_project_access", {"project_uuid": project_uuid, "email": EDITOR, "role": "viewer"})
+        await tool(
+            viewer, "grant_project_access", {"project_uuid": project_uuid, "email": EDITOR, "role": "viewer", "dry_run": False}
+        )
     )
     assert "Permission denied" in message
 
@@ -106,12 +109,17 @@ async def test_project_access_lifecycle(admin, tool, lightdash_admin, project_uu
     args = {"project_uuid": project_uuid}
 
     def direct_role(access) -> str | None:
-        return next(u["directRole"] for u in access["users"] if u["userUuid"] == editor_uuid)
+        return next((u["directRole"] for u in access["users"] if u["userUuid"] == editor_uuid), None)
 
-    ok(await tool(admin, "grant_project_access", {**args, "email": EDITOR, "role": "editor"}))
+    grant = {**args, "email": EDITOR, "role": "editor"}
+    assert ok(await tool(admin, "grant_project_access", grant))["wouldGrant"] == {"email": EDITOR, "role": "editor"}
+    assert direct_role(ok(await tool(admin, "list_project_access", args))) is None
+    ok(await tool(admin, "grant_project_access", {**grant, "dry_run": False}))
     assert direct_role(ok(await tool(admin, "list_project_access", args))) == "editor"
 
-    ok(await tool(admin, "update_project_access", {**args, "user_uuid": editor_uuid, "role": "viewer"}))
+    update = {**args, "user_uuid": editor_uuid, "role": "viewer"}
+    assert ok(await tool(admin, "update_project_access", update))["wouldChange"]["from"] == "editor"
+    ok(await tool(admin, "update_project_access", {**update, "dry_run": False}))
     assert direct_role(ok(await tool(admin, "list_project_access", args))) == "viewer"
 
     preview = ok(await tool(admin, "revoke_project_access", {**args, "user_uuid": editor_uuid}))
@@ -129,8 +137,11 @@ async def test_group_membership(admin, tool, editor_uuid):
     def members() -> set[str]:
         return {m["userUuid"] for m in next(g for g in groups if g["groupUuid"] == group["groupUuid"])["members"]}
 
-    ok(await tool(admin, "add_group_member", args))
-    ok(await tool(admin, "add_group_member", args))  # idempotent
+    assert ok(await tool(admin, "add_group_member", args))["wouldAdd"]["group"] == "Org 1 Group"
+    groups = ok(await tool(admin, "list_groups"))
+    assert editor_uuid not in members()
+    ok(await tool(admin, "add_group_member", {**args, "dry_run": False}))
+    assert ok(await tool(admin, "add_group_member", {**args, "dry_run": False}))["added"] is None  # already a member
     groups = ok(await tool(admin, "list_groups"))
     assert editor_uuid in members()
 
