@@ -1,5 +1,6 @@
 import base64
 import binascii
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -27,7 +28,8 @@ from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
 REDIS_TIMEOUT = 5  # seconds: a Redis that stops answering fails a request instead of hanging it
-RETRY_AFTER = 5  # seconds, for a /revoke that found the grant's lock busy
+RETRY_AFTER = 5  # seconds, for a /revoke that Redis or the grant's lock kept from finishing
+UNAVAILABLE = "This server's storage didn't answer. Try again in a moment."
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # as the SDK's token endpoint answers
 
 
@@ -153,21 +155,51 @@ def _basic_credentials(authorization: str) -> tuple[str, str] | None:
     return (unquote(client_id), unquote(secret)) if separator and client_id else None
 
 
-async def busy(request: Request, error: Exception) -> Response:
-    """A grant's lock stayed busy where the SDK catches no error: in /revoke, and in /token's reuse check of a refresh
-    token, which ends the grant. The exchanges themselves answer a busy lock with a TokenError."""
-    if request.url.path == "/token":
-        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY)
+class TryAgain:
+    """Answer Redis failing, or a grant's lock staying busy, in /token or /revoke with an error the client can retry.
+
+    The SDK catches only TokenError, and only around the exchanges, which answer a busy lock themselves. Redis also
+    runs in the client lookup, the token loads (also from the SDK's Bearer middleware) and /token's reuse check of a
+    refresh token. Added as the app's outermost middleware, inside its 500 handler, to see all of them. Other paths keep
+    their 500.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] not in ("/token", "/revoke"):
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked)
+        except RedisError as error:  # LockError too
+            if started:
+                raise
+            await _try_again(scope["path"], error)(scope, receive, send)
+
+
+def _try_again(path: str, error: RedisError) -> Response:
+    busy = isinstance(error, LockError)
+    if not busy:
+        record("storage_failed", logging.WARNING, path=path, error=type(error).__name__)
+    if path == "/token":
+        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY if busy else UNAVAILABLE)
         return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
-    if request.url.path == "/revoke":
-        # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
-        return Response(status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
-    raise error
+    # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later. RFC 7009
+    # defines no body for it, and temporarily_unavailable isn't a token endpoint code.
+    return Response(status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
 
 
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
     app = create_server(settings, redis).streamable_http_app(transport_security=transport_security(settings), host=settings.host)
-    app.add_exception_handler(LockError, busy)
+    app.add_middleware(TryAgain)
     return BasicAuthClientId(app)
 
 

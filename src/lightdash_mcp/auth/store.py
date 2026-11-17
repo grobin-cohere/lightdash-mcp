@@ -2,12 +2,14 @@
 
 import hashlib
 from collections.abc import Iterable
-from typing import TypeVar
+from types import TracebackType
+from typing import Any, TypeVar
 
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
+from redis.exceptions import RedisError
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -47,14 +49,17 @@ class Store:
     async def put(self, kind: str, key: str, value: BaseModel, ttl: int | None = None) -> None:
         await self._redis.set(self._key(kind, key), self._encrypt(kind, key, value), ex=_ttl(ttl))
 
-    async def write(self, put: Iterable[tuple[str, str, BaseModel, int]] = (), delete: Iterable[tuple[str, str]] = ()) -> None:
-        """Deletes, then puts, in one MULTI/EXEC: a crash or a cancellation leaves all of them or none."""
+    async def write(
+        self, put: Iterable[tuple[str, str, BaseModel, int]] = (), delete: Iterable[tuple[str, str]] = ()
+    ) -> list[Any]:
+        """Deletes, then puts, in one MULTI/EXEC: a crash or a cancellation leaves all of them or none. Returns the
+        commands' results in that order: for each delete, the number of keys it removed."""
         async with self._redis.pipeline(transaction=True) as pipe:
             for kind, key in delete:
                 pipe.delete(self._key(kind, key))
             for kind, key, value, ttl in put:
                 pipe.set(self._key(kind, key), self._encrypt(kind, key, value), ex=_ttl(ttl))
-            await pipe.execute()
+            return await pipe.execute()
 
     async def get(self, kind: str, key: str, model: type[M]) -> M | None:
         return self._load(kind, key, await self._redis.get(self._key(kind, key)), model)
@@ -76,11 +81,28 @@ class Store:
         await self._redis.aclose()
 
     def lock(self, kind: str, key: str) -> Lock:
-        """Raises LockError when it stays busy for LOCK_TIMEOUT. Not when it expired before its release: the work under
-        it is done by then, and an error would hide it, such as tokens that were already rotated."""
+        """Raises LockError when it stays busy for LOCK_TIMEOUT. Not when it expired before its release, or when Redis
+        fails the release: the work under it is done by then, and an error would hide it, such as tokens that were
+        already rotated. A lock left behind expires after LOCK_TIMEOUT."""
         return self._redis.lock(
-            self._key(f"lock:{kind}", key), timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_TIMEOUT, raise_on_release_error=False
+            self._key(f"lock:{kind}", key),
+            timeout=LOCK_TIMEOUT,
+            blocking_timeout=LOCK_TIMEOUT,
+            lock_class=_ReleasedOrExpiring,
+            raise_on_release_error=False,
         )
+
+
+class _ReleasedOrExpiring(Lock):
+    """A lock whose release, when Redis fails it, is left to expire. The error of the work under it still comes through."""
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        try:
+            await super().__aexit__(exc_type, exc_value, traceback)
+        except RedisError:
+            pass
 
 
 def _ttl(ttl: int | None) -> int | None:

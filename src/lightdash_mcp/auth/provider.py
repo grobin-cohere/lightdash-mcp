@@ -28,7 +28,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl, BaseModel, Field
-from redis.exceptions import LockError
+from redis.exceptions import LockError, RedisError
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
@@ -389,7 +389,7 @@ class LightdashOAuthProvider:
         except LockError:
             # Only taking the lock raises it (Store.lock), so nothing under it has run: the code isn't used yet.
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
-        await self.store.touch("client", client.client_id, CLIENT_TTL)
+        await self._renew_client(client)
         return tokens
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> Refresh | None:
@@ -425,8 +425,15 @@ class LightdashOAuthProvider:
                 tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
         except LockError:
             raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
-        await self.store.touch("client", client.client_id, CLIENT_TTL)
+        await self._renew_client(client)
         return tokens
+
+    async def _renew_client(self, client: OAuthClientInformationFull) -> None:
+        """Extends the client registration's expiry. The tokens are issued by then: a Redis failure only skips it."""
+        try:
+            await self.store.touch("client", client.client_id, CLIENT_TTL)
+        except RedisError:
+            pass
 
     async def load_access_token(self, token: str) -> Access | None:
         access = await self.store.get("access", digest(token), Access)
@@ -545,14 +552,20 @@ class LightdashOAuthProvider:
             await self._revoke_upstream(grant_id, grant)
 
     async def _end_grant(self, grant_id: str, reason: str, revoked: Access | Refresh | None = None) -> Grant | None:
-        """Ends the grant and its tokens, and logs the `revoked` token that ends it. The caller holds the grant's lock."""
-        grant = await self.store.pop("grant", grant_id, Grant)
-        if revoked and grant:
+        """Ends the grant and its tokens in one step, so a Redis failure leaves the grant whole or ended, and logs the
+        `revoked` token that ends it. The caller holds the grant's lock."""
+        grant = await self.store.get("grant", grant_id, Grant)
+        if not grant:
+            return None
+        ended, *_ = await self.store.write(
+            delete=[("grant", grant_id), ("access", grant.access_digest), ("refresh", grant.refresh_digest)]
+        )
+        if not ended:
+            return None  # ended meanwhile, by a request that took the lock once it expired
+        if revoked:
             # Logged once its grant is gone, from then on the token no longer loads, and only by the request that ended it.
             record("token_revoked", grant=grant_id, subject=revoked.subject, client_id=revoked.client_id)
-        if grant:
-            await self.store.write(delete=[("access", grant.access_digest), ("refresh", grant.refresh_digest)])
-            record("grant_ended", grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
+        record("grant_ended", grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
         return grant
 
     async def _revoke_upstream(self, grant_id: str, grant: Grant) -> None:
