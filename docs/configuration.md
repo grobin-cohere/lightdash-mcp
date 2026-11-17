@@ -77,8 +77,10 @@ uv run lightdash-mcp
 The image sets `HOST=0.0.0.0`: inside a container, the server must listen on every interface for a published port to reach it.
 
 ```bash
-docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp
+docker run --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
 ```
+
+Each release has its own image tag, such as `0.4.0`. `:latest` follows the newest one. Pin a version tag, so an upgrade happens only when you change it.
 
 Inside the container, `localhost` is the container itself. Point `REDIS_URL` at an address the container can reach, such as `redis://host.docker.internal:6379/0` for Redis on the host. `LIGHTDASH_URL` must be reachable from both the container and your browser, which signs in there.
 
@@ -87,7 +89,7 @@ With `network_mode: host`, the container shares the machine's interfaces, so `HO
 ```yaml
 services:
   lightdash-mcp:
-    image: ghcr.io/grobin-cohere/lightdash-mcp
+    image: ghcr.io/grobin-cohere/lightdash-mcp:0.4.0
     network_mode: host
     env_file: .env
     environment:
@@ -107,7 +109,7 @@ MCP clients keep a stream open to the server. On stop, the server gives them 3 s
 
 `GET /health` answers 200 when the server can reach Redis, and 503 when it can't. The Docker image uses it as its health check. Lightdash being down doesn't make the server unhealthy: tools say so instead.
 
-The server logs every tool call, with the user, the tool and its arguments, as in [Logs](architecture.md#logs).
+The server writes a JSON audit log of every tool call, with the user, the tool and its arguments, and of every sign-in event, as in [Logs](architecture.md#logs).
 
 ## Behind a proxy or a tunnel
 
@@ -162,6 +164,6 @@ redis-server --bind 127.0.0.1 --port 6380 --requirepass '<password>' --maxmemory
 | Claude.ai | Add a custom connector with `<PUBLIC_URL>/mcp`. Claude.ai needs a public HTTPS address |
 | ChatGPT | In developer mode, add a connector with `<PUBLIC_URL>/mcp` and OAuth. ChatGPT needs a public HTTPS address |
 
-On first use, the client opens a consent page on this server that names the client and shows the address it returns to, with a warning when that address is a website or an app rather than this computer. After **Allow**, Lightdash asks the user to sign in and approve, then the client is connected.
+On first use, the client opens a consent page on this server that names the client and shows the address it returns to, with a warning when that address is a website or an app rather than this computer. After **Continue to Lightdash**, Lightdash asks the user to sign in and approve, then the client is connected.
 
 To connect Claude.ai or ChatGPT to a local server, run a [tunnel](#tunnel).
