@@ -4,7 +4,7 @@ DEMO_DIR := $(LIGHTDASH_DIR)/examples/full-jaffle-shop-demo
 COMPOSE := LIGHTDASH_VERSION=$(LIGHTDASH_VERSION) docker compose -p lightdash-mcp-lightdash \
 	-f $(DEMO_DIR)/docker-compose.yml -f dev/lightdash.compose.yml
 
-.PHONY: dev mcp lightdash wait test lint logs stop clean
+.PHONY: dev mcp lightdash wait test lint check logs stop clean
 
 dev: lightdash wait .env mcp
 
@@ -37,6 +37,10 @@ test:
 lint:
 	uv run ruff check .
 	uv run ruff format --check .
+
+# What CI runs, in containers, with its own Lightdash (.dagger/). Needs the Dagger CLI.
+check:
+	dagger check
 
 logs:
 	$(COMPOSE) logs -f lightdash

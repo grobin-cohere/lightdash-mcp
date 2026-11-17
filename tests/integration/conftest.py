@@ -2,9 +2,13 @@
 
 The server runs in a thread on PUBLIC_PORT. Sign-in goes through the whole chain: client
 registration, authorize, consent page, Lightdash login and consent, callback, token.
+
+CI (`dagger check`) sets INTEGRATION_LIGHTDASH_URL and INTEGRATION_REDIS_URL to its own services. Then the
+tests wait for Lightdash to start, and fail instead of skipping when it doesn't.
 """
 
 import html
+import os
 import re
 import secrets
 import threading
@@ -25,7 +29,10 @@ from lightdash_mcp.auth.provider import _challenge
 from lightdash_mcp.config import Settings
 from lightdash_mcp.server import asgi_app
 
-LIGHTDASH = "http://localhost:8080"
+LIGHTDASH = os.environ.get("INTEGRATION_LIGHTDASH_URL", "http://localhost:8080")
+REDIS_URL = os.environ.get("INTEGRATION_REDIS_URL", "redis://localhost:6379/15")
+REQUIRED = "INTEGRATION_LIGHTDASH_URL" in os.environ
+STARTUP_TIMEOUT = 900  # seconds: a fresh Lightdash seeds its demo data and migrates before it answers
 PUBLIC_PORT = 8765
 PUBLIC = f"http://localhost:{PUBLIC_PORT}"
 CLIENT_REDIRECT = "http://localhost:9999/callback"
@@ -33,10 +40,23 @@ PASSWORD = "demo_password!"
 ADMIN, EDITOR, VIEWER = "demo@lightdash.com", "demo2@lightdash.com", "demo3@lightdash.com"
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def lightdash_answers() -> bool:
     try:
         httpx.get(f"{LIGHTDASH}/api/v1/health", timeout=3).raise_for_status()
     except httpx.HTTPError:
+        return False
+    return True
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    if REQUIRED:
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while not lightdash_answers():
+            if time.monotonic() > deadline:
+                pytest.exit(f"Lightdash at {LIGHTDASH} didn't start in {STARTUP_TIMEOUT} seconds", returncode=1)
+            time.sleep(5)
+        return
+    if not lightdash_answers():
         for item in items:
             if "integration" in str(item.path):
                 item.add_marker(pytest.mark.skip(reason="Lightdash is not running: make dev"))
@@ -59,7 +79,7 @@ def settings() -> Settings:
         lightdash_client_secret=registered["client_secret"],
         public_url=PUBLIC,
         fernet_key=Fernet.generate_key().decode(),
-        redis_url="redis://localhost:6379/15",
+        redis_url=REDIS_URL,
         port=PUBLIC_PORT,
     )
 

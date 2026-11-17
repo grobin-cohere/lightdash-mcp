@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet
 from fakeredis import FakeAsyncRedis
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from mcp.server.auth.provider import AuthorizationParams
+from mcp.server.auth.provider import AuthorizationParams, TokenError
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.auth import OAuthClientInformationFull
 from redis.asyncio.lock import Lock
@@ -156,18 +156,19 @@ async def test_a_second_revocation_of_an_ended_grant_logs_nothing(provider, capl
 
 
 @respx.mock
-async def test_a_revocation_that_outlasts_its_lock_is_logged_as_done(provider, caplog, monkeypatch):
+async def test_a_revocation_that_outlasts_its_lock_still_finishes(provider, caplog, monkeypatch):
     caplog.set_level(logging.INFO, "lightdash_mcp.audit")
     token = await provider.load_access_token(await add_grant(provider, 3600))
+    revoke = respx.post(REVOKE_URL).mock(return_value=httpx.Response(200))
 
     async def expired(self):
         raise LockNotOwnedError("Cannot release a lock that's no longer owned")
 
     monkeypatch.setattr(Lock, "release", expired)
-    with pytest.raises(LockNotOwnedError):
-        await provider.revoke_token(token)
+    await provider.revoke_token(token)
     assert audit_events(caplog) == ["token_revoked", "grant_ended"]
     assert await provider.load_access_token(token.token) is None
+    assert revoke.called
 
 
 def audit_events(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -249,8 +250,22 @@ async def test_malformed_refresh_answer_is_a_retryable_tool_error(provider):
         auth_context_var.reset(reset)
 
 
+async def test_a_lock_finds_its_own_token_after_a_lost_answer(provider, monkeypatch):
+    monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
+    lock = provider.store.lock("grant", "grant")
+    # As a SET NX that Redis applied, but whose answer was lost, leaves it for the retry.
+    await lock.redis.set(lock.name, b"mine", px=60_000)
+    assert await lock.acquire(token=b"mine")
+    assert not await provider.store.lock("grant", "grant").acquire(token=b"another")
+
+
+def test_the_grant_lock_outlasts_a_refresh_and_its_redis_commands():
+    assert provider_module.REFRESH_TIMEOUT >= 10
+    assert provider_module.REFRESH_TIMEOUT + 4 * store_module.REDIS_COMMAND_TIMEOUT <= store_module.LOCK_TIMEOUT
+
+
 async def test_a_refresh_lock_held_too_long_is_a_retryable_tool_error(provider, monkeypatch):
-    monkeypatch.setattr(store_module, "LOCK_TIMEOUT", 0.1)
+    monkeypatch.setattr(store_module, "LOCK_WAIT", 0.1)
     access = await add_grant(provider, 10)
     reset = signed_in_as(await provider.load_access_token(access))
     try:
@@ -318,8 +333,10 @@ async def test_refresh_token_survives_lightdash_being_down(provider):
     await add_grant(provider, 3600)
     refresh = await refresh_of(provider)
     respx.post(TOKEN_URL).mock(side_effect=httpx.ConnectError("down"))
-    with pytest.raises(RefreshFailed):
+    with pytest.raises(TokenError) as error:
         await provider.exchange_refresh_token(CLIENT, refresh, [])
+    assert error.value.error == "invalid_request"
+    assert error.value.error_description == "Couldn't reach Lightdash to refresh your sign-in. Try again in a moment."
     assert await refresh_of(provider) == refresh
 
     respx.post(TOKEN_URL).mock(return_value=REFRESHED)
