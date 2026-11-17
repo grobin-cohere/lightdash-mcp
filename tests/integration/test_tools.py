@@ -290,12 +290,14 @@ async def test_saved_content_tools(viewer, tool, project_uuid, filtered_dashboar
     )
 
 
-async def test_tool_calls_are_logged(admin, tool, project_uuid, caplog):
+async def test_tool_calls_are_logged(admin, tool, project_uuid, lightdash_admin, caplog):
+    admin_uuid = lightdash_admin.get("/api/v1/user").json()["results"]["userUuid"]
+    other = "00000000-0000-4000-8000-000000000000"
     caplog.set_level(logging.INFO, logger="lightdash_mcp.audit")
     ok(await tool(admin, "list_spaces", {"project_uuid": project_uuid}))
-    denied(await tool(admin, "list_spaces", {"project_uuid": "00000000-0000-4000-8000-000000000000"}))
+    denied(await tool(admin, "list_spaces", {"project_uuid": other}))
     lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "lightdash_mcp.audit"]
     entries = [line for line in lines if line["event"] == "tool_call"]
-    assert len(entries) == 2 and all(e["tool"] == "list_spaces" and e["user"] is not None for e in entries)
+    assert len(entries) == 2 and all(e["tool"] == "list_spaces" and e["user"] == admin_uuid for e in entries)
     assert entries[0]["arguments"]["project_uuid"] == project_uuid and entries[0]["error"] is False
-    assert entries[1]["error"] is True
+    assert entries[1]["arguments"]["project_uuid"] == other and entries[1]["error"] is True
