@@ -6,7 +6,7 @@ One Python process: an MCP server built on the official MCP Python SDK (`MCPServ
 
 | Module | Owns |
 | --- | --- |
-| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the tool-call audit log, allowed hosts, and the Basic-header fix on `/token` and `/revoke` |
+| `server.py` | Builds the server: auth settings, consent, callback and health routes, tools, the tool-call audit log, allowed hosts, the Basic-header fix on `/token` and `/revoke`, and their answer to a busy grant lock |
 | `config.py` | Settings from the environment |
 | `auth/provider.py` | The OAuth provider: clients, consent, Lightdash callback, codes and tokens, upstream refresh |
 | `auth/pages.py` | The consent and error pages |
@@ -60,6 +60,22 @@ Registration is open, as MCP clients need, so it checks what it stores:
 - A refresh token works once. Its digest is kept for 14 days after its exchange: presented again by its client, it was copied, and the grant ends, here and on Lightdash. A second refresh still in flight with the same token is only refused.
 - When Lightdash refuses a refresh with `invalid_grant`, the grant ends and the user signs in again. Any other error, such as `invalid_client` from a wrong client secret, a malformed answer, or Lightdash being unreachable, keeps the grant and the client's refresh token so it can retry.
 - Revoking a token ends the grant here and revokes its refresh token on Lightdash, with this server's Lightdash client credentials. A refusal or a failure there is logged. The revocation waits for a refresh in flight on the same grant, so the refresh can't bring the grant back or issue tokens after it.
+- A lock that expires before its holder releases it is not an error: the work under it is saved by then. For a refresh, an error would hide new tokens that have already replaced the old ones. A refresh rarely outlasts the lock, as it gives up on Lightdash after 20 seconds. If one does, a revocation that took the expired lock meanwhile can't stop it: the refresh puts the grant back.
+
+### When `/token` or `/revoke` can't finish for now
+
+| Case | Answer | Kept |
+| --- | --- | --- |
+| Lightdash fails a refresh: unreachable, no answer in 20 seconds, an error status other than `invalid_grant`, or a malformed answer | `/token`: 400 `invalid_request`, with why and "Try again in a moment." | The grant and the refresh token |
+| The grant's lock stays busy for 30 seconds, during a code or refresh exchange | `/token`: 400 `invalid_request`, "Try again in a moment." | The grant, and the code or refresh token |
+| The lock stays busy while a reused refresh token is found | `/token`: the same 400 `invalid_request`. The grant ends only if the token is presented again, and nothing is logged until then | The grant |
+| The lock stays busy during a revocation | `/revoke`: 503, `Retry-After: 5`, no body | The grant and its tokens |
+
+Why `invalid_request` on `/token`: RFC 6749 section 5.2 has no `server_error` or `temporarily_unavailable` code for the token endpoint, and the MCP SDK fails with a 500 on any code outside its list: RFC 6749's codes and RFC 8707's `invalid_target`. Of the codes it allows, `invalid_grant` tells clients that the session has ended, so they drop it and sign in again. `invalid_client` and `unauthorized_client` make some clients drop their registration. `invalid_request` says nothing about the grant or the client, so a client may retry with the same code or refresh token. Not every client does: the MCP Python SDK's client drops its tokens after any failed refresh and signs in again.
+
+Why 503 on `/revoke`: RFC 7009 section 2.2.1 says that after a 503 the client must assume the token still works, and may try again later. Ending the grant without its lock would let the exchange in flight bring the grant back.
+
+The SDK catches errors only around the code and refresh exchanges. A busy lock elsewhere in `/token` (the reuse check) or in `/revoke` reaches `busy` in `server.py`, which gives the answers above.
 
 ## Storage
 
@@ -101,7 +117,7 @@ The `lightdash_mcp.audit` logger writes one JSON object per line, so a value sen
 | `sign_in_failed` | Lightdash's code exchange or user lookup fails, at WARNING | `client_id` |
 | `refresh_failed` | A Lightdash refresh fails but keeps the grant, at WARNING | `grant`, `subject`, `client_id`, `reason` |
 | `token_revoked` | A client's revocation ends a grant, once the grant is removed, before `grant_ended`. A token whose grant has already ended is revoked without a log line | `grant`, `subject`, `client_id` |
-| `revoke_busy` | A revocation fails because the grant's lock stays busy for 30 seconds, at WARNING. The grant and its tokens are kept | `grant`, `subject`, `client_id` |
+| `revoke_busy` | A revocation fails because the grant's lock stays busy for 30 seconds, at WARNING. `/revoke` answers 503, and the grant and its tokens are kept | `grant`, `subject`, `client_id` |
 | `grant_ended` | A grant ends | `grant`, `subject`, `client_id`, `reason`: `revoked`, `lightdash_refused_refresh` or `refresh_token_reused` |
 | `lightdash_revoke_failed` | Lightdash refuses or misses a revocation, at WARNING | `grant`, `subject`, `failure` (status or error) |
 

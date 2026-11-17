@@ -28,7 +28,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl, BaseModel, Field
-from redis.exceptions import LockError, LockNotOwnedError
+from redis.exceptions import LockError
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
@@ -72,6 +72,11 @@ S256_CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 BLOCKED_SCHEMES = ("javascript", "data", "vbscript", "file", "blob")
 # Lightdash errors the client can act on. The others are about this server's request to Lightdash.
 FORWARDED_ERRORS = ("access_denied", "temporarily_unavailable")
+# The token endpoint's answer to a failure the client can retry, with the same refresh token or code. RFC 6749 has no
+# server_error for it, and the SDK accepts no code outside RFC 6749's: invalid_request is the one that says nothing
+# about the grant or the client. invalid_grant would end the client's session, invalid_client its registration.
+RETRY_ERROR = "invalid_request"
+GRANT_BUSY = "Another request is refreshing or ending this sign-in. Try again in a moment."
 
 
 class SignInRequired(Exception):
@@ -373,13 +378,17 @@ class LightdashOAuthProvider:
 
     async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code: Code) -> OAuthToken:
         grant_id = authorization_code.grant_id
-        async with self.store.lock("grant", grant_id):
-            if not await self.store.pop("code", digest(authorization_code.code), Code):
-                raise TokenError("invalid_grant", "Authorization code already used")
-            grant = await self.store.get("grant", grant_id, Grant)
-            if not grant or grant.code_digest != digest(authorization_code.code):
-                raise TokenError("invalid_grant", "Sign-in ended")
-            tokens = await self._issue(grant_id, grant, authorization_code.scopes, authorization_code.resource)
+        try:
+            async with self.store.lock("grant", grant_id):
+                if not await self.store.pop("code", digest(authorization_code.code), Code):
+                    raise TokenError("invalid_grant", "Authorization code already used")
+                grant = await self.store.get("grant", grant_id, Grant)
+                if not grant or grant.code_digest != digest(authorization_code.code):
+                    raise TokenError("invalid_grant", "Sign-in ended")
+                tokens = await self._issue(grant_id, grant, authorization_code.scopes, authorization_code.resource)
+        except LockError:
+            # Only taking the lock raises it (Store.lock), so nothing under it has run: the code isn't used yet.
+            raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
         return tokens
 
@@ -401,16 +410,21 @@ class LightdashOAuthProvider:
         # Under the grant's lock from start to end, so a revocation waits for it, and the old refresh token is
         # replaced only when the new tokens are written: on any failure, the client can retry with it.
         grant_id = refresh_token.grant_id
-        async with self.store.lock("grant", grant_id):
-            grant = await self.store.get("grant", grant_id, Grant)
-            if not grant or grant.refresh_digest != digest(refresh_token.token):
-                raise TokenError("invalid_grant", "Refresh token already used")
-            try:
-                # Keeps the Lightdash sign-in alive as long as the client's, and catches a revoked one now.
-                await self._refresh_lightdash(grant_id, grant)
-            except SignInRequired:
-                raise TokenError("invalid_grant", "Lightdash sign-in ended") from None
-            tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
+        try:
+            async with self.store.lock("grant", grant_id):
+                grant = await self.store.get("grant", grant_id, Grant)
+                if not grant or grant.refresh_digest != digest(refresh_token.token):
+                    raise TokenError("invalid_grant", "Refresh token already used")
+                try:
+                    # Keeps the Lightdash sign-in alive as long as the client's, and catches a revoked one now.
+                    await self._refresh_lightdash(grant_id, grant)
+                except SignInRequired:
+                    raise TokenError("invalid_grant", "Lightdash sign-in ended") from None
+                except RefreshFailed as error:
+                    raise TokenError(RETRY_ERROR, str(error)) from None
+                tokens = await self._issue(grant_id, grant, scopes or refresh_token.scopes, refresh_token.resource)
+        except LockError:
+            raise TokenError(RETRY_ERROR, GRANT_BUSY) from None
         await self.store.touch("client", client.client_id, CLIENT_TTL)
         return tokens
 
@@ -424,9 +438,7 @@ class LightdashOAuthProvider:
     async def revoke_token(self, token: Access | Refresh) -> None:
         try:
             await self.end_grant(token.grant_id, "revoked", revoke_upstream=True, revoked=token)
-        except LockNotOwnedError:
-            raise  # the lock expired before its release: the grant is ended and logged, Lightdash's token isn't revoked
-        except LockError:
+        except LockError:  # only taking the lock raises it (Store.lock): nothing is revoked
             record("revoke_busy", logging.WARNING, grant=token.grant_id, subject=token.subject, client_id=token.client_id)
             raise
 

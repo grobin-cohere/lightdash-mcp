@@ -6,25 +6,29 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import uvicorn
+from mcp.server.auth.handlers.token import TokenErrorResponse
+from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import LockError, RedisError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lightdash_mcp.auth.audit import clip, clip_arguments, record
-from lightdash_mcp.auth.provider import FORM_LIMIT, SCOPE, LightdashOAuthProvider, read_body
+from lightdash_mcp.auth.provider import FORM_LIMIT, GRANT_BUSY, RETRY_ERROR, SCOPE, LightdashOAuthProvider, read_body
 from lightdash_mcp.auth.store import Store
 from lightdash_mcp.config import Settings
 from lightdash_mcp.tools import access, code, content, data, schedulers
 
 SHUTDOWN_TIMEOUT = 3
 REDIS_TIMEOUT = 5  # seconds: a Redis that stops answering fails a request instead of hanging it
+RETRY_AFTER = 5  # seconds, for a /revoke that found the grant's lock busy
+NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # as the SDK's token endpoint answers
 
 
 async def audit(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
@@ -149,8 +153,21 @@ def _basic_credentials(authorization: str) -> tuple[str, str] | None:
     return (unquote(client_id), unquote(secret)) if separator and client_id else None
 
 
+async def busy(request: Request, error: Exception) -> Response:
+    """A grant's lock stayed busy where the SDK catches no error: in /revoke, and in /token's reuse check of a refresh
+    token, which ends the grant. The exchanges themselves answer a busy lock with a TokenError."""
+    if request.url.path == "/token":
+        content = TokenErrorResponse(error=RETRY_ERROR, error_description=GRANT_BUSY)
+        return PydanticJSONResponse(content, status_code=400, headers=NO_STORE)
+    if request.url.path == "/revoke":
+        # RFC 7009 section 2.2.1: on a 503 the client assumes the token still works, and may try again later.
+        return Response(status_code=503, headers={**NO_STORE, "Retry-After": str(RETRY_AFTER)})
+    raise error
+
+
 def asgi_app(settings: Settings, redis: Redis | None = None) -> ASGIApp:
     app = create_server(settings, redis).streamable_http_app(transport_security=transport_security(settings), host=settings.host)
+    app.add_exception_handler(LockError, busy)
     return BasicAuthClientId(app)
 
 
