@@ -1,4 +1,5 @@
-"""The sign-in flow's refusals: registration, /authorize, the consent page and the Lightdash callback."""
+"""The sign-in flow's refusals: registration, /authorize, the consent page and the Lightdash
+callback."""
 
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -8,6 +9,7 @@ import respx
 from mcp.server.auth.provider import AuthorizationParams, AuthorizeError, RegistrationError
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
+from starlette.responses import Response
 
 from lightdash_mcp.auth.provider import (
     MAX_STATE,
@@ -19,18 +21,25 @@ from lightdash_mcp.auth.provider import (
 from .conftest import LIGHTDASH, REDIRECT, TOKEN_URL, token_response
 
 USER_URL = f"{LIGHTDASH}/api/v1/user"
+CONSENT = "/oauth/consent"
+CALLBACK = "/oauth/lightdash/callback"
 
 
 def request(
-    path: str, query: dict | None = None, cookies: dict | None = None, form: dict | None = None
+    path: str,
+    query: dict | None = None,
+    cookies: dict | None = None,
+    form: dict | None = None,
 ) -> Request:
     headers = []
-    if cookies:
-        headers.append(
-            (b"cookie", "; ".join(f"{name}={value}" for name, value in cookies.items()).encode())
-        )
+    has_form = form is not None
     body = urlencode(form or {}).encode()
-    if form is not None:
+
+    if cookies:
+        pairs = [f"{name}={value}" for name, value in cookies.items()]
+        headers.append((b"cookie", "; ".join(pairs).encode()))
+
+    if has_form:
         headers += [
             (b"content-type", b"application/x-www-form-urlencoded"),
             (b"content-length", str(len(body)).encode()),
@@ -39,13 +48,15 @@ def request(
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
 
+    method = "POST" if has_form else "GET"
     scope = {
         "type": "http",
-        "method": "POST" if form is not None else "GET",
+        "method": method,
         "path": path,
         "query_string": urlencode(query or {}).encode(),
         "headers": headers,
     }
+
     return Request(scope, receive)
 
 
@@ -56,6 +67,7 @@ def client(*redirect_uris: str, **fields) -> OAuthClientInformationFull:
         "redirect_uris": list(redirect_uris or [REDIRECT]),
         **fields,
     }
+
     return OAuthClientInformationFull(**fields)
 
 
@@ -67,76 +79,100 @@ def params(**overrides) -> AuthorizationParams:
         "redirect_uri": REDIRECT,
         "redirect_uri_provided_explicitly": True,
     }
+
     return AuthorizationParams(**{**fields, **overrides})
+
+
+def query_of(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlparse(url).query)
 
 
 async def start(provider: LightdashOAuthProvider) -> tuple[str, str]:
     """A registered client's /authorize. Returns the transaction ID and its CSRF token."""
     await provider.register_client(client())
     location = await provider.authorize(client(), params())
-    transaction_id = parse_qs(urlparse(location).query)["transaction"][0]
-    return transaction_id, (
-        await provider.store.get("transaction", transaction_id, Transaction)
-    ).csrf
+    transaction_id = query_of(location)["transaction"][0]
+    transaction = await provider.store.get("transaction", transaction_id, Transaction)
+
+    return transaction_id, transaction.csrf
+
+
+async def approve(provider: LightdashOAuthProvider, transaction_id: str) -> None:
+    transaction = await provider.store.get("transaction", transaction_id, Transaction)
+    approved = transaction.model_copy(update={"approved": True})
+
+    await provider.store.put("transaction", transaction_id, approved)
+
+
+async def submit_consent(
+    provider: LightdashOAuthProvider,
+    transaction_id: str,
+    csrf: str | None,
+    cookies: dict,
+    action: str = "allow",
+) -> Response:
+    form = {"transaction": transaction_id, "action": action}
+
+    if csrf:
+        form["csrf"] = csrf
+
+    return await provider.consent_submit(request(CONSENT, cookies=cookies, form=form))
 
 
 async def test_the_consent_form_needs_the_csrf_token_and_the_cookie(provider):
     transaction_id, csrf = await start(provider)
     cookie = _consent_cookie(transaction_id)
-    for form_csrf, cookies in [
+    refused = [
         (None, {cookie: csrf}),
         ("wrong", {cookie: csrf}),
-        (
-            "é" * 43,
-            {cookie: csrf},
-        ),  # compare_digest raises TypeError on a non-ASCII str: it must be a 400, not a 500
+        # compare_digest raises TypeError on a non-ASCII str: it must be a 400, not a 500.
+        ("é" * 43, {cookie: csrf}),
         (csrf, {}),
         (csrf, {cookie: "wrong"}),
         (csrf, {cookie: "é"}),
         (csrf, {_consent_cookie("another transaction"): csrf}),
-    ]:
-        form = {"transaction": transaction_id, "action": "allow"} | (
-            {"csrf": form_csrf} if form_csrf else {}
-        )
-        response = await provider.consent_submit(
-            request("/oauth/consent", cookies=cookies, form=form)
-        )
-        assert response.status_code == 400, (form_csrf, cookies)
-        assert not (await provider.store.get("transaction", transaction_id, Transaction)).approved
+    ]
 
-    form = {"transaction": transaction_id, "csrf": csrf, "action": "allow"}
-    response = await provider.consent_submit(
-        request("/oauth/consent", cookies={cookie: csrf}, form=form)
-    )
-    assert response.status_code == 303
-    assert response.headers["location"].startswith(f"{LIGHTDASH}/api/v1/oauth/authorize?")
+    for form_csrf, cookies in refused:
+        response = await submit_consent(provider, transaction_id, form_csrf, cookies)
+        transaction = await provider.store.get("transaction", transaction_id, Transaction)
+
+        assert response.status_code == 400, (form_csrf, cookies)
+        assert not transaction.approved
+
+    allowed = await submit_consent(provider, transaction_id, csrf, {cookie: csrf})
+
+    assert allowed.status_code == 303
+    assert allowed.headers["location"].startswith(f"{LIGHTDASH}/api/v1/oauth/authorize?")
 
 
 async def test_a_second_load_of_the_consent_page_keeps_the_first_one_working(provider):
     transaction_id, csrf = await start(provider)
-    for _ in range(2):  # a prefetch, or a second tab
-        page = await provider.consent_page(
-            request("/oauth/consent", {"transaction": transaction_id})
-        )
+    cookies = {_consent_cookie(transaction_id): csrf}
+
+    # A prefetch, or a second tab.
+    for _ in range(2):
+        page = await provider.consent_page(request(CONSENT, {"transaction": transaction_id}))
+
         assert f'name="csrf" value="{csrf}"' in page.body.decode()
-    form = {"transaction": transaction_id, "csrf": csrf, "action": "allow"}
-    response = await provider.consent_submit(
-        request("/oauth/consent", cookies={_consent_cookie(transaction_id): csrf}, form=form)
-    )
+
+    response = await submit_consent(provider, transaction_id, csrf, cookies)
+
     assert response.status_code == 303
 
 
 async def test_a_large_consent_form_is_refused(provider):
     transaction_id, csrf = await start(provider)
+    cookies = {_consent_cookie(transaction_id): csrf}
     form = {
         "transaction": transaction_id,
         "csrf": csrf,
         "action": "allow",
         "padding": "x" * 100_000,
     }
-    response = await provider.consent_submit(
-        request("/oauth/consent", cookies={_consent_cookie(transaction_id): csrf}, form=form)
-    )
+
+    response = await provider.consent_submit(request(CONSENT, cookies=cookies, form=form))
+
     assert response.status_code == 413
 
 
@@ -144,52 +180,54 @@ async def test_the_callback_needs_an_approved_sign_in_and_its_cookie(provider):
     transaction_id, csrf = await start(provider)
     cookie = _consent_cookie(transaction_id)
     query = {"state": transaction_id, "code": "lightdash-code"}
-    # Not approved yet, as with a Lightdash link sent before the consent page.
-    assert (
-        await provider.lightdash_callback(
-            request("/oauth/lightdash/callback", query, {cookie: csrf})
-        )
-    ).status_code == 400
 
-    transaction = await provider.store.get("transaction", transaction_id, Transaction)
-    await provider.store.put(
-        "transaction", transaction_id, transaction.model_copy(update={"approved": True})
-    )
+    # Not approved yet, as with a Lightdash link sent before the consent page.
+    early = await provider.lightdash_callback(request(CALLBACK, query, {cookie: csrf}))
+
+    assert early.status_code == 400
+
+    await approve(provider, transaction_id)
+
     for cookies in ({}, {cookie: "wrong"}, {cookie: "é"}):
-        response = await provider.lightdash_callback(
-            request("/oauth/lightdash/callback", query, cookies)
-        )
+        response = await provider.lightdash_callback(request(CALLBACK, query, cookies))
+
         assert response.status_code == 400
         assert "location" not in response.headers
+
     # The refused callbacks didn't use the sign-in up.
-    assert await provider.store.get("transaction", transaction_id, Transaction)
-    assert (
-        await provider.lightdash_callback(
-            request("/oauth/lightdash/callback", {"state": "unknown"}, {cookie: csrf})
-        )
-    ).status_code == 400
+    transaction = await provider.store.get("transaction", transaction_id, Transaction)
+
+    assert transaction
+
+    unknown = request(CALLBACK, {"state": "unknown"}, {cookie: csrf})
+    response = await provider.lightdash_callback(unknown)
+
+    assert response.status_code == 400
 
 
 @respx.mock
 async def test_lightdash_errors_reach_the_client_as_standard_codes(provider):
-    for error, forwarded in [
+    errors = [
         ("access_denied", "access_denied"),
         ("temporarily_unavailable", "temporarily_unavailable"),
         ("invalid_client", "server_error"),
         ("<script>", "server_error"),
         (None, "server_error"),
-    ]:
+    ]
+
+    for error, forwarded in errors:
         transaction_id, csrf = await start(provider)
-        transaction = await provider.store.get("transaction", transaction_id, Transaction)
-        await provider.store.put(
-            "transaction", transaction_id, transaction.model_copy(update={"approved": True})
-        )
-        query = {"state": transaction_id} | ({"error": error} if error else {})
-        response = await provider.lightdash_callback(
-            request("/oauth/lightdash/callback", query, {_consent_cookie(transaction_id): csrf})
-        )
+        await approve(provider, transaction_id)
+        cookies = {_consent_cookie(transaction_id): csrf}
+        query = {"state": transaction_id}
+
+        if error:
+            query["error"] = error
+
+        response = await provider.lightdash_callback(request(CALLBACK, query, cookies))
+
         assert response.status_code == 302
-        assert parse_qs(urlparse(response.headers["location"]).query)["error"] == [forwarded]
+        assert query_of(response.headers["location"])["error"] == [forwarded]
 
 
 @pytest.mark.parametrize(
@@ -212,8 +250,10 @@ async def test_lightdash_errors_reach_the_client_as_standard_codes(provider):
 async def test_registration_refuses_unsafe_redirect_uris(provider, uri):
     with pytest.raises(RegistrationError) as error:
         await provider.register_client(client(uri))
+
+    registered = await provider.get_client("client")
     assert error.value.error == "invalid_redirect_uri"
-    assert await provider.get_client("client") is None
+    assert registered is None
 
 
 @pytest.mark.parametrize(
@@ -229,84 +269,95 @@ async def test_registration_refuses_unsafe_redirect_uris(provider, uri):
 )
 async def test_registration_accepts_loopback_https_and_app_redirect_uris(provider, uri):
     await provider.register_client(client(uri))
-    assert await provider.get_client("client")
+
+    registered = await provider.get_client("client")
+    assert registered
 
 
 async def test_redirect_hosts_restrict_https_redirect_uris(provider):
     provider.settings.redirect_hosts = ["dex.example.com"]
-    with pytest.raises(RegistrationError):
-        await provider.register_client(client("https://claude.ai/api/mcp/auth_callback"))
-    await provider.register_client(
-        client("https://dex.example.com/callback", "http://localhost:9999/callback", "myapp://done")
+    unlisted = client("https://claude.ai/api/mcp/auth_callback")
+    listed = client(
+        "https://dex.example.com/callback",
+        "http://localhost:9999/callback",
+        "myapp://done",
     )
+
+    with pytest.raises(RegistrationError):
+        await provider.register_client(unlisted)
+
+    await provider.register_client(listed)
 
 
 async def test_registration_keeps_what_redis_stores_small(provider):
-    for oversized in [
+    many_redirect_uris = [f"http://localhost:{port}/callback" for port in range(11)]
+    long_grant_types = ["x" * 100] * 100
+    oversized = [
         client(client_name="x" * 201),
-        client(*[f"http://localhost:{port}/callback" for port in range(11)]),
-        client(grant_types=["authorization_code", *("x" * 100 for _ in range(100))]),
-    ]:
-        with pytest.raises(RegistrationError):
-            await provider.register_client(oversized)
-    assert await provider.get_client("client") is None
+        client(*many_redirect_uris),
+        client(grant_types=["authorization_code", *long_grant_types]),
+    ]
+    with_extras = client(logo_uri="https://example.com/logo.png", contacts=["admin@example.com"])
 
-    await provider.register_client(
-        client(logo_uri="https://example.com/logo.png", contacts=["admin@example.com"])
-    )
+    for too_big in oversized:
+        with pytest.raises(RegistrationError):
+            await provider.register_client(too_big)
+
+    registered = await provider.get_client("client")
+    assert registered is None
+
+    await provider.register_client(with_extras)
+
     stored = await provider.get_client("client")
-    assert (stored.client_name, stored.logo_uri, stored.contacts) == ("App", None, None)
+    assert stored.client_name == "App"
+    assert stored.logo_uri is None
+    assert stored.contacts is None
 
 
 async def test_authorize_refuses_oversized_requests(provider):
-    for oversized in [
+    refused = [
         params(code_challenge="x" * 4000),
         params(code_challenge="x" * 42 + "!"),
         params(state="x" * 1025),
-    ]:
+    ]
+
+    for authorization in refused:
         with pytest.raises(AuthorizeError) as error:
-            await provider.authorize(client(), oversized)
+            await provider.authorize(client(), authorization)
+
         assert error.value.error == "invalid_request"
-    assert not await provider.store._redis.keys("lightdash-mcp:transaction:*")
+
+    transactions = await provider.store._redis.keys("lightdash-mcp:transaction:*")
+    assert not transactions
 
 
 @respx.mock
 async def test_a_failed_lightdash_sign_in_returns_to_the_client(provider):
     transaction_id, csrf = await start(provider)
-    transaction = await provider.store.get("transaction", transaction_id, Transaction)
-    await provider.store.put(
-        "transaction", transaction_id, transaction.model_copy(update={"approved": True})
-    )
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "only"}))
-    response = await provider.lightdash_callback(
-        request(
-            "/oauth/lightdash/callback",
-            {"state": transaction_id, "code": "c"},
-            {_consent_cookie(transaction_id): csrf},
-        )
-    )
-    assert parse_qs(urlparse(response.headers["location"]).query)["error"] == ["server_error"]
+    await approve(provider, transaction_id)
+    without_refresh_token = httpx.Response(200, json={"access_token": "only"})
+    respx.post(TOKEN_URL).mock(return_value=without_refresh_token)
+    query = {"state": transaction_id, "code": "c"}
+    cookies = {_consent_cookie(transaction_id): csrf}
 
+    response = await provider.lightdash_callback(request(CALLBACK, query, cookies))
 
-async def approve(provider: LightdashOAuthProvider, transaction_id: str) -> None:
-    transaction = await provider.store.get("transaction", transaction_id, Transaction)
-    approved = transaction.model_copy(update={"approved": True})
-    await provider.store.put("transaction", transaction_id, approved)
+    assert query_of(response.headers["location"])["error"] == ["server_error"]
 
 
 async def test_the_consent_page_escapes_the_client_name_and_cannot_be_framed(provider):
     await provider.register_client(client(client_name='<script>x</script>"'))
     location = await provider.authorize(client(), params())
-    transaction_id = parse_qs(urlparse(location).query)["transaction"][0]
+    transaction_id = query_of(location)["transaction"][0]
 
-    page = await provider.consent_page(request("/oauth/consent", {"transaction": transaction_id}))
+    page = await provider.consent_page(request(CONSENT, {"transaction": transaction_id}))
 
     body = page.body.decode()
+    cookie = page.headers["set-cookie"].lower()
     assert "<script>x</script>" not in body
     assert "&lt;script&gt;x&lt;/script&gt;&quot;" in body
     assert page.headers["content-security-policy"] == "frame-ancestors 'none'"
     assert page.headers["cache-control"] == "no-store"
-    cookie = page.headers["set-cookie"].lower()
     assert "httponly" in cookie
     assert "samesite=lax" in cookie
     assert "path=/oauth" in cookie
@@ -315,17 +366,18 @@ async def test_the_consent_page_escapes_the_client_name_and_cannot_be_framed(pro
 async def test_a_denied_consent_returns_to_the_client(provider):
     transaction_id, csrf = await start(provider)
     cookie = _consent_cookie(transaction_id)
-    form = {"transaction": transaction_id, "csrf": csrf, "action": "deny"}
-    denied = request("/oauth/consent", cookies={cookie: csrf}, form=form)
 
-    response = await provider.consent_submit(denied)
+    response = await submit_consent(provider, transaction_id, csrf, {cookie: csrf}, "deny")
 
     assert response.status_code == 302
+
     location = urlparse(response.headers["location"])
-    assert f"{location.scheme}://{location.netloc}{location.path}" == REDIRECT
-    assert parse_qs(location.query) == {"error": ["access_denied"], "state": ["client-state"]}
-    assert await provider.store.get("transaction", transaction_id, Transaction) is None
+    returned_to = f"{location.scheme}://{location.netloc}{location.path}"
+    transaction = await provider.store.get("transaction", transaction_id, Transaction)
     deleted = response.headers["set-cookie"].lower()
+    assert returned_to == REDIRECT
+    assert parse_qs(location.query) == {"error": ["access_denied"], "state": ["client-state"]}
+    assert transaction is None
     assert deleted.startswith(f'{cookie}="";')
     assert "max-age=0" in deleted
     assert "path=/oauth" in deleted
@@ -335,7 +387,7 @@ async def test_the_consent_page_expires_with_its_client(provider):
     transaction_id, _ = await start(provider)
     await provider.store.delete("client", "client")
 
-    page = await provider.consent_page(request("/oauth/consent", {"transaction": transaction_id}))
+    page = await provider.consent_page(request(CONSENT, {"transaction": transaction_id}))
 
     assert page.status_code == 400
     assert "Sign-in expired" in page.body.decode()
@@ -346,22 +398,21 @@ async def test_the_consent_page_expires_with_its_client(provider):
 async def test_a_callback_works_once(provider):
     transaction_id, csrf = await start(provider)
     cookies = {_consent_cookie(transaction_id): csrf}
-    form = {"transaction": transaction_id, "csrf": csrf, "action": "allow"}
-    await provider.consent_submit(request("/oauth/consent", cookies=cookies, form=form))
-    respx.post(TOKEN_URL).mock(return_value=token_response())
+    await submit_consent(provider, transaction_id, csrf, cookies)
     user = httpx.Response(200, json={"results": {"userUuid": "user"}})
+    respx.post(TOKEN_URL).mock(return_value=token_response())
     respx.get(USER_URL).mock(return_value=user)
-    callback = "/oauth/lightdash/callback"
     query = {"state": transaction_id, "code": "lightdash-code"}
 
-    first = await provider.lightdash_callback(request(callback, query, cookies))
-    replayed = await provider.lightdash_callback(request(callback, query, cookies))
+    first = await provider.lightdash_callback(request(CALLBACK, query, cookies))
+    replayed = await provider.lightdash_callback(request(CALLBACK, query, cookies))
 
+    grants = await provider.store._redis.keys("lightdash-mcp:grant:*")
     assert first.status_code == 302
-    assert "code" in parse_qs(urlparse(first.headers["location"]).query)
+    assert "code" in query_of(first.headers["location"])
     assert replayed.status_code == 400
     assert "Sign-in expired" in replayed.body.decode()
-    assert len(await provider.store._redis.keys("lightdash-mcp:grant:*")) == 1
+    assert len(grants) == 1
 
 
 @pytest.mark.parametrize(
@@ -381,13 +432,14 @@ async def test_a_sign_in_without_a_lightdash_user_returns_to_the_client(provider
     respx.get(USER_URL).mock(return_value=user)
     query = {"state": transaction_id, "code": "lightdash-code"}
     cookies = {_consent_cookie(transaction_id): csrf}
-    callback = request("/oauth/lightdash/callback", query, cookies)
+    callback = request(CALLBACK, query, cookies)
 
     response = await provider.lightdash_callback(callback)
 
+    grants = await provider.store._redis.keys("lightdash-mcp:grant:*")
     assert response.status_code == 302
-    assert parse_qs(urlparse(response.headers["location"]).query)["error"] == ["server_error"]
-    assert not await provider.store._redis.keys("lightdash-mcp:grant:*")
+    assert query_of(response.headers["location"])["error"] == ["server_error"]
+    assert not grants
 
 
 async def test_authorize_refuses_an_oversized_resource(provider):
@@ -396,5 +448,6 @@ async def test_authorize_refuses_an_oversized_resource(provider):
     with pytest.raises(AuthorizeError) as error:
         await provider.authorize(client(), params(resource=resource))
 
+    transactions = await provider.store._redis.keys("lightdash-mcp:transaction:*")
     assert error.value.error == "invalid_request"
-    assert not await provider.store._redis.keys("lightdash-mcp:transaction:*")
+    assert not transactions
