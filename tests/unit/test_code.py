@@ -66,8 +66,9 @@ def mock_lightdash(existing: list[dict] | None = None, spaces: list[str] = ("my_
         return_value=httpx.Response(200, json={"results": EXPLORE})
     )
     for kind in ("charts", "dashboards"):
+        missing_ids = list(missing) if kind == "charts" else []
         respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/code/{kind}").mock(
-            return_value=httpx.Response(200, json={"results": {kind: existing or [], "missingIds": list(missing)}})
+            return_value=httpx.Response(200, json={"results": {kind: existing or [], "missingIds": missing_ids}})
         )
     respx.get(f"{LIGHTDASH}/api/v1/projects/{PROJECT}/spaces").mock(
         return_value=httpx.Response(200, json={"results": [{"slug": path.split(".")[-1], "path": path} for path in spaces]})
@@ -307,6 +308,8 @@ async def test_save_dashboard_needs_its_charts_saved_first(call):
     previewed = await call("save_dashboard", args)
     assert previewed["chartsNotSavedYet"] == ["revenue-per-week"]
     assert previewed["next"].startswith("Nothing is saved yet. Save revenue-per-week with save_chart and dry_run=false")
+    charts_read = [c.request.url for c in respx.calls if c.request.url.path.endswith("/code/charts")]
+    assert [url.params.get_list("ids") for url in charts_read] == [["revenue-per-week"]]
 
     with pytest.raises(ToolError, match="No chart with slug revenue-per-week in this project yet"):
         await call("save_dashboard", args | {"dry_run": False})
@@ -335,9 +338,12 @@ async def test_replacing_a_dashboard_with_the_tool_keeps_its_tabs(call):
 async def test_code_is_read_by_slug(call):
     mock_lightdash(existing=[CHART])
     assert await call("get_chart_code", {"project_uuid": PROJECT, "slug": "revenue-per-week"}) == CHART
+    assert respx.calls.last.request.url.params.get_list("ids") == ["revenue-per-week"]
     respx.reset()
     mock_lightdash(existing=[DASHBOARD])
     assert await call("get_dashboard_code", {"project_uuid": PROJECT, "slug": "sales"}) == DASHBOARD
+    assert respx.calls.last.request.url.path.endswith("/code/dashboards")
+    assert respx.calls.last.request.url.params.get_list("ids") == ["sales"]
     respx.reset()
     mock_lightdash()
     with pytest.raises(ToolError, match="No chart with slug revenue-per-week in this project"):
@@ -347,13 +353,13 @@ async def test_code_is_read_by_slug(call):
 
 
 @respx.mock
-async def test_save_raises_a_refused_validation():
-    mock_upsert()
+async def test_save_raises_a_401_from_validation():
+    upsert = mock_upsert()
     mock_validate(answer=httpx.Response(401, json={"error": {"message": "Unauthorized"}}))
     async with httpx.AsyncClient(base_url=LIGHTDASH) as http:
         with pytest.raises(LightdashError) as error:
             await save(await client(http), PROJECT, "charts", CHART, LIGHTDASH)
-    assert error.value.status == 401
+    assert error.value.status == 401 and upsert.called
 
 
 @respx.mock
