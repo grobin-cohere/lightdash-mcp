@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for coding agents working in this repository. `CLAUDE.md` points here, so Claude Code reads it too.
 
 lightdash-mcp: an MCP server for self-hosted Lightdash (data queries, access, content, deliveries). Python 3.15+, managed with uv.
 
