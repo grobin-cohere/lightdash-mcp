@@ -28,6 +28,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl, BaseModel, Field
+from redis.exceptions import LockError, LockNotOwnedError
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
@@ -421,8 +422,13 @@ class LightdashOAuthProvider:
         return access if grant and grant.access_digest == digest(token) and grant.client_id == access.client_id else None
 
     async def revoke_token(self, token: Access | Refresh) -> None:
-        record("token_revoked", grant=token.grant_id, subject=token.subject, client_id=token.client_id)
-        await self.end_grant(token.grant_id, "revoked", revoke_upstream=True)
+        try:
+            await self.end_grant(token.grant_id, "revoked", revoke_upstream=True, revoked=token)
+        except LockNotOwnedError:
+            raise  # the lock expired before its release: the revocation is done, and logged
+        except LockError:
+            record("revoke_busy", logging.WARNING, grant=token.grant_id, subject=token.subject, client_id=token.client_id)
+            raise
 
     async def _issue(self, grant_id: str, grant: Grant, scopes: list[str], resource: str | None) -> OAuthToken:
         """New tokens for the grant, written with it in one step. The caller holds the grant's lock."""
@@ -517,16 +523,21 @@ class LightdashOAuthProvider:
         record("refresh_failed", logging.WARNING, grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
         return RefreshFailed(f"{reason}. Try again in a moment.")
 
-    async def end_grant(self, grant_id: str, reason: str, revoke_upstream: bool = False) -> None:
+    async def end_grant(
+        self, grant_id: str, reason: str, revoke_upstream: bool = False, revoked: Access | Refresh | None = None
+    ) -> None:
         # Under the grant's lock, so a refresh or token exchange in flight can't put the grant back.
         async with self.store.lock("grant", grant_id):
-            grant = await self._end_grant(grant_id, reason)
+            grant = await self._end_grant(grant_id, reason, revoked)
         if grant and revoke_upstream:
             await self._revoke_upstream(grant_id, grant)
 
-    async def _end_grant(self, grant_id: str, reason: str) -> Grant | None:
-        """Ends the grant and its tokens. The caller holds the grant's lock."""
+    async def _end_grant(self, grant_id: str, reason: str, revoked: Access | Refresh | None = None) -> Grant | None:
+        """Ends the grant and its tokens, and logs the `revoked` token that ends it. The caller holds the grant's lock."""
         grant = await self.store.pop("grant", grant_id, Grant)
+        if revoked:
+            # Logged once its grant is gone: from then on, the token no longer loads.
+            record("token_revoked", grant=grant_id, subject=revoked.subject, client_id=revoked.client_id)
         if grant:
             await self.store.write(delete=[("access", grant.access_digest), ("refresh", grant.refresh_digest)])
             record("grant_ended", grant=grant_id, subject=grant.subject, client_id=grant.client_id, reason=reason)
